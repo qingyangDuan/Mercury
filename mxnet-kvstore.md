@@ -586,7 +586,7 @@ method：
 
 - **EncodeDefaultKey()**
 
-   <font color=red>这里用 bigarray_bound_ 作为门槛执行tensor partition来实现 servers load balancing， 调用ps::Postoffice::Get()->GetServerKeyRanges() 协助实现。</font>GetServerKeyRanges() 返回的是 ps::Postoffice 的成员 std::vector<Range> server_key_ranges\_，它的初始化如下,即把计算机的整数值域划分成 num\_servers_ 个互相独立的块。
+   <font color=red>这里用 bigarray_bound_ 作为门槛执行tensor partition来实现 servers load balancing（参数分配， parameter assignment）， 调用ps::Postoffice::Get()->GetServerKeyRanges() 协助实现。</font>GetServerKeyRanges() 返回的是 ps::Postoffice 的成员 std::vector<Range> server_key_ranges\_，它的初始化如下,即把计算机的整数值域划分成 num\_servers_ 个互相独立的块。
 
    ```c++
    Key kMaxKey = std::numeric_limits<Key>::max();    
@@ -1309,6 +1309,10 @@ Trainer.\_params:  list of Parameter instances. Trainer._param2idx 保存 Parame
 
 
 
+**原因： 数据集cifar10 的单个输入图片长宽小于标准数据集（imagenet）的图片输入。数据集会影响模型大小（单个图片的长宽对应于模型中的某些节点数量）。batch-size不会影响模型大小。**
+
+
+
 ### Worker Init function path
 
 **main path** :
@@ -1418,9 +1422,9 @@ main path:
 
 main path:
 
-- ZMQVan.RecvMsg() --> Van.Receiving() --> Customer.Accept() --> Customer.recv_queue_.Push(msg)
+- **ZMQVan.RecvMsg() --> Van.Receiving() --> Customer.Accept() --> Customer.recv_queue_.Push(msg)**
 
-- Customer.Receiving() --> ps::KVWorker.Process()
+- **Customer.Receiving() --> ps::KVWorker.Process()**
 
   KVWorker.Process() 是处理 server Response 信息的函数，部分代码如下。之前worker执行init，push，pull操作时，都会在发送时根据timestamp保存cd或 cd_0。
 
@@ -1461,9 +1465,9 @@ main path:
 
 main path:
 
-- ZMQVan.RecvMsg() --> Van.Receiving() --> Customer.Accept() --> Customer.recv_queue_.Push(msg)
+- **ZMQVan.RecvMsg() --> Van.Receiving() --> Customer.Accept() --> Customer.recv_queue_.Push(msg)**
 
-- Customer.Receiving() --> ps::KVServer.Process() --> KVStoreDistServer.DataHandleEx() -->  KVStoreDistServer.DataHandleDefault()
+- **Customer.Receiving() --> ps::KVServer.Process() --> KVStoreDistServer.DataHandleEx() -->  KVStoreDistServer.DataHandleDefault()**
 
 KVStoreDistServer.DataHandleDefault()中：
 
