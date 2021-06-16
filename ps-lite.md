@@ -39,14 +39,23 @@ using namespace ps;
 ### 2.1 全局初始化流程
 
 - W\S\H：class Postoffice中：初始化static PostOffice和 它的 Van，全局都用同一个PostOffice --> Create(Van)用来做通信的发/发 --> 从环境变量中读入配置 --> 确定不同的角色。
-- W\S\H：Start() --> PostOffice::Start() --> Van::Start(), my_node_/Scheduler的初始化, 使worker和server都与scheduler绑定:
-	- W\S：绑定port并连接到同一个Scheduler
-	- W\S：发送信息到指定ID
-	- W\S\H： <font color=red>在van中起一个Reciving的线程 ，这个线程会利用ZMQVan.RecvMsg()接受消息</font>
-	- H：收到信息并回发
-	- W\S: 收到信息
-	- Van::Start()结束后，PostOffice::Start() 设置barrier，主线程阻塞。直至scheduler的 Van::Receiving() 线程收到所有的 node 的 barrier msg，之后解除自己及所有node的barrier，主线程才恢复。
+
+- W\S\H：Start() --> PostOffice::Start() --> ZMQVan::Start() --> Van::Start()
+
+  从 Van::Start() 开始， Van会执行 my_node_/Scheduler的初始化, 使worker和server都与scheduler绑定。 具体流程如下流程：
+
+  - H ( Van::Start ) ：根据环境变量获得ip和port，并把van绑定到这个地址
+  - W\S ( Van::Start ) ：根据环境变量获得interface，生成合适的ip和port，绑定van到这个地址。
+  - W\S\H ( Van::Start ) ： <font color=red>在van中起一个Reciving的线程 ，这个线程会利用ZMQVan.RecvMsg()接受消息。这个线程的作用就是使得本节点可以接受其他节点传过来的控制信息。</font>
+  - W\S (Van::Start) : 发送 ADD_NODE 消息给scheduler，从而连接Scheduler。
+  - H ( Van::ProcessAddNodeCommand ) ：接受 ADD_NODE 消息
+  - H ( Van::UpdataLocalID ) ：接受 ADD_NODE 消息， 把 server 和 worker 的节点信息保存在 meta* **nodes** 中。
+  - H ( Van::ProcessAddNodeCommandAtScheduler ) ：收到所有的servers + worker 的 ADD_NODE信息后，便分配rank(即id) 。 把所有的nodes（包括H自己）的id、ip、port等信息打包在 meta* **nodes**中，然后发送 ADD_NODE消息给所有的 W\S, 当然这个消息中携带了 **nodes** 信息。 
+  - W\S ( Van::ProcessAddNodeCommand ) : 收到 ADD_NODE 信息后，先在 Van::UpdataLocalID 更新自己的id为 H分配的数值。之后对消息中的 meta* **nodes** 信息包含的所有节点，都执行 ZMQVan::Connect(node)，即连接到了所有的其他节点。 <font color=red>当然ZMQVan中会避免重复连接同一个节点（因此此前 W\S 已经连接过了H）；也会避免 server连接server、worker连接worker，因为这是无意义的。</font>
+  - W\S\H ( PostOffice::Start ) : Van::Start()结束后，PostOffice::Start() 执行 Barrier()。 这个函数会向scheduler发送 BARRIER 消息并阻塞主线程。scheduler的 Van::Receiving() 线程收到所有的 node 的 barrier msg，即表示所有节点都完成了上述的初始化，然后scheduler解除自己及所有node的barrier，主线程恢复。 <font color=red> BARRIER消息中的 msg.meta.request 为 true 代表一个普通的 BARRIER消息， 为false则代表一个解除当前 BARRIER的消息。</font>
+
 - W\S：初始化SimpleApp --> New Customer（绑定SimpleAPP::Process作为Customer的recv_handle_，调用PostOffice::AddCustomer将当前Customer注册到PostOffice） --> <font color=red>Customer起一个Receiving线程</font>
+
 - W\S\H：Finalize()
 
 所以使用ps-lite主要是两步：(1) W\S\H 运行Start(),  (2) W\S创建对应自己角色的app（如worker）。而mxnet使用ps-lite的方法就是在KVStoreDist的创建函数和RunServer中创建ps::Worker, 创建ps::Server, 运行ps::StartAsync()。
@@ -158,6 +167,12 @@ SimpleApp 和 Customer类中的 id：
 
 ### 3.5 id rank
 
+Every node's id is unique, scheduler's id is always 1.
+
+- **scheduler id is 1**
+
+- servers rank：0、1、2、3......; **server node.rank to id**: id = rank * 2 + 8
+- workers rank：0、1、2、3......; **worker node.rank to id**: id = rank * 2 + 9
 - **node.id to rank**:  rank = std::max((id - 8) / 2, 0)
 
 ​      
