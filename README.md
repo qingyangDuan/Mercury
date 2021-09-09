@@ -1,1 +1,1 @@
-# MxnetNotes
+# MercuryProject
