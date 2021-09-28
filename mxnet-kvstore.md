@@ -405,7 +405,7 @@ classes：
 
 KVStoreDist 继承自 KVStoreLocal ； 而 KVStoreLocal 继承自 KVStore。
 
-当我们使用`dist-*`去create KVStore的时候，就会使用到类`KVStoreDist`。`KVStoreDist`分两个主要部分，一个是worker，一个是server。 如果该节点是**worker**，首先会创建一个`ps_worker_ = new ps::KVWorker<char>(0, new_customer_id);`这个`ps::KVWorker`将在**pslite**部分具体解析，它是主要的完成`push`和`pull`操作的部分。
+当我们使用`dist-*`去create KVStore的时候，就会使用到类`KVStoreDist`。`KVStoreDist`分两个主要部分，一个是worker，一个是server。 如果该节点是**worker**，首先会创建一个`ps_worker_ = new ps::KVWorker<char>(0, new_customer_id);`这个`ps::KVWorker`将在**ps-lite**部分具体解析，它是主要的完成`push`和`pull`操作的部分。
 
 members:
 
@@ -454,312 +454,364 @@ members:
   };
 ```
 
-method：
+methods：
 
-- constructor 实例创建函数：
+#### constructor 实例创建函数
 
-  创建了 ps::KVWorker 实例，KVStoreDist 之后会调用它的 Push， Pull， Wait 等函数。
-  
-  ```c++
-    explicit KVStoreDist(bool use_device_comm)
-        : KVStoreLocal(use_device_comm), ps_worker_(nullptr), server_(nullptr) {
-      if (IsWorkerNode()) {
-        int new_customer_id = GetNewCustomerId();
-        ps_worker_ = new ps::KVWorker<char>(0, new_customer_id);
-        ps::StartAsync(new_customer_id, "mxnet\0");
-        if (!ps::Postoffice::Get()->is_recovery()) {
-          ps::Postoffice::Get()->Barrier(
-            new_customer_id,
-            ps::kWorkerGroup + ps::kServerGroup + ps::kScheduler);
+创建了 ps::KVWorker 实例，KVStoreDist 之后会调用它的 Push， Pull， Wait 等函数。
+
+```c++
+  explicit KVStoreDist(bool use_device_comm)
+      : KVStoreLocal(use_device_comm), ps_worker_(nullptr), server_(nullptr) {
+    if (IsWorkerNode()) {
+      int new_customer_id = GetNewCustomerId();
+      ps_worker_ = new ps::KVWorker<char>(0, new_customer_id);
+      ps::StartAsync(new_customer_id, "mxnet\0");
+      if (!ps::Postoffice::Get()->is_recovery()) {
+        ps::Postoffice::Get()->Barrier(
+          new_customer_id,
+          ps::kWorkerGroup + ps::kServerGroup + ps::kScheduler);
+      }
+    }
+    bigarray_bound_ = dmlc::GetEnv("MXNET_KVSTORE_BIGARRAY_BOUND", 1000 * 1000);
+    log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
+}
+```
+
+- 可以看出，<font color=red>如果当前是 **worker** node，KVStoreDist会创建一个 ps_worker_ 的成员，然后运行 ps::StartAsync , 再运行barrier `ps::Postoffice::Get()->Barrier( ,7)`</font>。  ps::StartAsync 与ps::Start 的唯一区别是，StartAsync中，当Postoffice和 van的 start初始化完成之后，不会执行Barrier(7)。因此上述创建函数中需要再手动设置barrier。
+
+#### **InitImpl()**
+
+这个函数被 Init() 调用。这个函数调用 **comm_->Init()**  和 **Push_**协助完成参数初始化，<font color=red>且规定Push_的 do_merge 为 false</font>
+
+```c++
+  void InitImpl(const std::vector<int>& keys,
+                const std::vector<NDArray>& values) override {
+    CheckUnique(keys);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      comm_->Init(keys[i], values[i].storage_type(), values[i].shape(), values[i].dtype());
+    }
+    if (get_rank() == 0 && this->ps_worker_->get_customer()->customer_id() == 0) {
+      Push_(keys, values, 0, false);
+      // wait until the push is finished
+      for (const int key : keys) {
+        comm_buf_[key].WaitToWrite();
+        compr_buf_[key].WaitToWrite();
+      }
+    } else {
+      // do nothing
+    }
+    if (!ps::Postoffice::Get()->is_recovery()) {
+      Barrier();
+    }
+  }
+```
+
+
+
+#### set_updater()
+
+updater的设置是通过python端的函数定义来完成的，它通过ctype转换成为了c端的函数，并且通过pickle序列化为字符串传递给server。
+当然，我们的主要注意力还是放在`push`和`pull`的实现上。
+
+#### **PushImpl()**
+<font color=red>调用 Push_ 并规定 do_merge 为 true</font>
+
+```c++
+   void PushImpl(const std::vector<int>& keys,
+                 const std::vector<NDArray>& values,
+                 int priority) override {
+     Push_(keys, values, priority, true);
+   }
+```
+
+ 
+
+#### **Push_()**
+
+若 do_merge 为 true，push操作首先会通过`comm_-> Reduce()`操作。之后结果存储在`comm_buf_[key]`中。
+
+调用 **EncodeDefaultKey** 函数将存储为`key : int`和`val : NDArray`形式的KVPair，转化为`PSKV`形式，该形式用于Push操作。<font color=red>同时也实现servers load balancing。</font>
+
+之后会通过**PushDefault**方法完成操作，该方法定义了函数`push_to_servers`，将`comm_buf_[key]`作为输入，通过`Engine::Get()->PushAsync`方法完成**push**操作的异步执行（只是将任务发给Engine，由Engine完成调度）。Engine会在适当的时机执行`push_to_servers`. <font color=red>push_to_servers`函数调用了`ps_worker_`的`ZPush`方法来完成分布式的push操作。</font>
+
+```c++
+void Push_(const std::vector<int>& keys,
+           const std::vector<NDArray>& values,
+           int priority,
+           bool do_merge) {
+  // first aggregate the values over keys
+  std::vector<int> uniq_keys;
+  std::vector<std::vector<NDArray> > grouped_vals;
+  GroupKVPairsPush(keys, values, &uniq_keys, &grouped_vals, false);
+
+  for (size_t i = 0; i < uniq_keys.size(); ++i) {
+    // merge over devices
+    int key = uniq_keys[i];
+    const auto& vals = grouped_vals[i];
+    NDArray merged = do_merge ? comm_->Reduce(key, vals, priority) : vals[0];
+
+    const auto storage_type = merged.storage_type();
+    auto &comm_buf = comm_buf_[key];
+      
+      
+    if (merged.ctx().dev_mask() == cpu::kDevMask) {
+      // Start of a push doesn't guarantee that the previous pushes are completed.
+      // This shouldn't affect training of networks though because training involves
+      // a sequence of push, pull, then push. This imposes ordering that the
+      // second push happens after the first pull, and the pull happens after first push.
+      comm_buf = merged;  // avoid memory copy
+    } else {
+      if (comm_buf.is_none()) {
+        if (storage_type == kDefaultStorage) {
+          comm_buf = NDArray(merged.shape(), pinned_ctx_, true, merged.dtype());
+        } else {
+          comm_buf = NDArray(storage_type, merged.shape(), pinned_ctx_, true, merged.dtype());
         }
       }
-      bigarray_bound_ = dmlc::GetEnv("MXNET_KVSTORE_BIGARRAY_BOUND", 1000 * 1000);
-      log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
+      CopyFromTo(merged, &comm_buf);
+    }
+      
+      
+    const int dtype = merged.dtype();
+    const int num_bytes = mshadow::mshadow_sizeof(dtype);
+    // push to servers
+    if (storage_type == kDefaultStorage) {
+      if (gradient_compression_->get_type() == CompressionType::kNone) {
+        PSKV& pskv = EncodeDefaultKey(key, comm_buf.shape().Size(), num_bytes);
+        PushDefault(key, comm_buf, pskv, priority);
+      } 
+    } 
   }
-  ```
-  
-  - 可以看出，<font color=red>如果当前是 **worker** node，KVStoreDist会创建一个 ps_worker_ 的成员，然后运行 ps::StartAsync , 再运行barrier `ps::Postoffice::Get()->Barrier( ,7)`</font>。  ps::StartAsync 与ps::Start 的唯一区别是，StartAsync中，当Postoffice和 van的 start初始化完成之后，不会执行Barrier(7)。因此上述创建函数中需要再手动设置barrier。
-  
-- **InitImpl()**
+}
+```
 
-   这个函数被 Init() 调用。这个函数调用 **comm_->Init()**  和 **Push_**协助完成参数初始化，<font color=red>且规定Push_的 do_merge 为 false</font>
+#### **EncodeDefaultKey()**
 
-   ```c++
-     void InitImpl(const std::vector<int>& keys,
-                   const std::vector<NDArray>& values) override {
-       CheckUnique(keys);
-       for (size_t i = 0; i < keys.size(); ++i) {
-         comm_->Init(keys[i], values[i].storage_type(), values[i].shape(), values[i].dtype());
-       }
-       if (get_rank() == 0 && this->ps_worker_->get_customer()->customer_id() == 0) {
-         Push_(keys, values, 0, false);
-         // wait until the push is finished
-         for (const int key : keys) {
-           comm_buf_[key].WaitToWrite();
-           compr_buf_[key].WaitToWrite();
-         }
-       } else {
-         // do nothing
-       }
-       if (!ps::Postoffice::Get()->is_recovery()) {
-         Barrier();
-       }
-     }
-   ```
+<font color=red>这里用 bigarray_bound_ 作为门槛执行tensor partition来实现 servers load balancing（参数分配， parameter assignment）， 调用ps::Postoffice::Get()->GetServerKeyRanges() 协助实现。</font>GetServerKeyRanges() 返回的是 ps::Postoffice 的成员 std::vector<Range> server_key_ranges\_，它的初始化如下,即把计算机的整数值域划分成 num\_servers_ 个互相独立的块。
 
-   
+```c++
+Key kMaxKey = std::numeric_limits<Key>::max();    
+for (int i = 0; i < num_servers_; ++i) {
+      server_key_ranges_.push_back(Range(
+          kMaxKey / num_servers_ * i,
+          kMaxKey / num_servers_ * (i+1)));
+}
+```
 
-- `set_updater`：updater的设置是通过python端的函数定义来完成的，它通过ctype转换成为了c端的函数，并且通过pickle序列化为字符串传递给server。
-   当然，我们的主要注意力还是放在`push`和`pull`的实现上。
+函数把 key 转换成 ps_key, 使得每个ps_key 位于那个server的Range，这样之后的 ps::Van() 发送 tensor 时就可以根据 ps_key 的数值大小决定发给哪个server。
 
-- **PushImpl()**
-  <font color=red>调用 Push_ 并规定 do_merge 为 true</font>
+如果 num_arr_elems < bigarray\_bound\_，那么 pskv 保存这个tensor的 ps_key和长度信息。
 
-   ```c++
-     void PushImpl(const std::vector<int>& keys,
-                   const std::vector<NDArray>& values,
-                   int priority) override {
-       Push_(keys, values, priority, true);
-     }
-   ```
+如果 num_arr_elems > bigarray\_bound\_，那么把这个tensor切分成 num_servers 份，然后 pskv 保存切分后的小 tensors 们的 ps_key和长度信息。
 
-   
 
-- **Push_()**
 
-   若 do_merge 为 true，push操作首先会通过`comm_-> Reduce()`操作。之后结果存储在`comm_buf_[key]`中。
 
-   调用 **EncodeDefaultKey** 函数将存储为`key : int`和`val : NDArray`形式的KVPair，转化为`PSKV`形式，该形式用于Push操作。<font color=red>同时也实现servers load balancing。</font>
 
-   之后会通过**PushDefault**方法完成操作，该方法定义了函数`push_to_servers`，将`comm_buf_[key]`作为输入，通过`Engine::Get()->PushAsync`方法完成**push**操作的异步执行（只是将任务发给Engine，由Engine完成调度）。Engine会在适当的时机执行`push_to_servers`. <font color=red>push_to_servers`函数调用了`ps_worker_`的`ZPush`方法来完成分布式的push操作。</font>
+```c++
+ /**
+   * \brief convert to pskv for parameter server
+   * \param key
+   * \param num_arr_elems number of elements in the value for key
+   * \param num_bytes size of each element in number of bytes
+   * \return PSKV used for both push and pull
+   */
+  inline PSKV& EncodeDefaultKey(const int key, const size_t num_arr_elems,
+                                const int num_bytes) {
+    mu_.lock();
+    PSKV& pskv = ps_kv_[key];
+    mu_.unlock();
+    size_t pskv_size = num_arr_elems * num_bytes;
+    if (!pskv.keys.empty()) {
+      CHECK_EQ(static_cast<size_t>(pskv.size), pskv_size)
+        << "The value size cannot be changed " << pskv_size << ". Key is " << key;
+    } else {
+      auto krs = ps::Postoffice::Get()->GetServerKeyRanges();
+      const int num_servers = krs.size();
+      CHECK_GT(num_servers, 0);
 
-   ```c++
-   void Push_(const std::vector<int>& keys,
-              const std::vector<NDArray>& values,
-              int priority,
-              bool do_merge) {
-     // first aggregate the values over keys
-     std::vector<int> uniq_keys;
-     std::vector<std::vector<NDArray> > grouped_vals;
-     GroupKVPairsPush(keys, values, &uniq_keys, &grouped_vals, false);
-   
-     for (size_t i = 0; i < uniq_keys.size(); ++i) {
-       // merge over devices
-       int key = uniq_keys[i];
-       const auto& vals = grouped_vals[i];
-       NDArray merged = do_merge ? comm_->Reduce(key, vals, priority) : vals[0];
-   
-       const auto storage_type = merged.storage_type();
-       auto &comm_buf = comm_buf_[key];
-         
-         
-       if (merged.ctx().dev_mask() == cpu::kDevMask) {
-         // Start of a push doesn't guarantee that the previous pushes are completed.
-         // This shouldn't affect training of networks though because training involves
-         // a sequence of push, pull, then push. This imposes ordering that the
-         // second push happens after the first pull, and the pull happens after first push.
-         comm_buf = merged;  // avoid memory copy
-       } else {
-         if (comm_buf.is_none()) {
-           if (storage_type == kDefaultStorage) {
-             comm_buf = NDArray(merged.shape(), pinned_ctx_, true, merged.dtype());
-           } else {
-             comm_buf = NDArray(storage_type, merged.shape(), pinned_ctx_, true, merged.dtype());
-           }
-         }
-         CopyFromTo(merged, &comm_buf);
-       }
-         
-         
-       const int dtype = merged.dtype();
-       const int num_bytes = mshadow::mshadow_sizeof(dtype);
-       // push to servers
-       if (storage_type == kDefaultStorage) {
-         if (gradient_compression_->get_type() == CompressionType::kNone) {
-           PSKV& pskv = EncodeDefaultKey(key, comm_buf.shape().Size(), num_bytes);
-           PushDefault(key, comm_buf, pskv, priority);
-         } 
-       } 
-     }
-   }
-   ```
+      // a simple heuristic for load balance
+      if (num_arr_elems < bigarray_bound_) {
+        // send it to a single random picked server
+        int server = (key * 9973) % num_servers;
+        ps::Key ps_key = krs[server].begin() + key;
+        CHECK_LT(ps_key, krs[server].end());
+        pskv.keys.push_back(ps_key);
+        const int total_bytes = num_arr_elems * num_bytes;
+        pskv.lens.push_back(total_bytes);
+        pskv.size = total_bytes;
+      } else {
+        // parition it to all servers
+        pskv.size = 0;
+        for (int i = 0; i < num_servers; ++i) {
+          size_t part_size =
+            static_cast<size_t>(round(static_cast<double>(num_arr_elems)/num_servers*(i+1))) -
+            static_cast<size_t>(round(static_cast<double>(num_arr_elems)/num_servers*i));
+          ps::Key ps_key = krs[i].begin() + key;
+          CHECK_LT(ps_key, krs[i].end());
+          pskv.keys.push_back(ps_key);
+          const int total_bytes = part_size * num_bytes;
+          pskv.lens.push_back(total_bytes);
+          pskv.size += total_bytes;
+        }
+      }
+      CHECK_EQ(static_cast<size_t>(pskv.size), pskv_size);
+    }
+    return pskv;
+  }
+```
 
-- **EncodeDefaultKey()**
+#### **PushDefault()**
 
-   <font color=red>这里用 bigarray_bound_ 作为门槛执行tensor partition来实现 servers load balancing（参数分配， parameter assignment）， 调用ps::Postoffice::Get()->GetServerKeyRanges() 协助实现。</font>GetServerKeyRanges() 返回的是 ps::Postoffice 的成员 std::vector<Range> server_key_ranges\_，它的初始化如下,即把计算机的整数值域划分成 num\_servers_ 个互相独立的块。
+这里ket-value pair 主体是 key和send_buf,  pskv 保存这个tensor是否被切割及切割后的信息。
 
-   ```c++
-   Key kMaxKey = std::numeric_limits<Key>::max();    
-   for (int i = 0; i < num_servers_; ++i) {
-         server_key_ranges_.push_back(Range(
-             kMaxKey / num_servers_ * i,
-             kMaxKey / num_servers_ * (i+1)));
-   }
-   ```
+传递给ps_worker_->ZPush()的参数是 pskv.keys, vals, pskv.lens
 
-   函数把 key 转换成 ps_key, 使得每个ps_key 位于那个server的Range，这样之后的 ps::Van() 发送 tensor 时就可以根据 ps_key 的数值大小决定发给哪个server。
+```c++
 
-   如果 num_arr_elems < bigarray\_bound\_，那么 pskv 保存这个tensor的 ps_key和长度信息。
+  void PushDefault(int key, const NDArray &send_buf, const PSKV& pskv, int priority) {
+    auto push_to_servers =
+        [this, key, pskv, send_buf](RunContext rctx, Engine::CallbackOnComplete cb) {
+          const int dtype = send_buf.dtype();
+          // convert to ps keys
+          const size_t size = send_buf.shape().Size() * mshadow::mshadow_sizeof(dtype);
+          char* data = static_cast<char *>(send_buf.data().dptr_);
+          // do push. false means no delete
+          ps::SArray<char> vals(data, size, false);
+          int cmd = GetCommandType(RequestType::kDefaultPushPull, dtype);
+          CHECK_NOTNULL(ps_worker_)->ZPush(
+              pskv.keys, vals, pskv.lens,
+              cmd, [cb]() { cb(); });
+        };
+    Engine::Get()->PushAsync(
+        push_to_servers,
+        pinned_ctx_,
+        {send_buf.var()},
+        {},
+        FnProperty::kNormal,
+        priority,
+        "KVStoreDistDefaultPush");
+  }
+```
 
-   如果 num_arr_elems > bigarray\_bound\_，那么把这个tensor切分成 num_servers 份，然后 pskv 保存切分后的小 tensors 们的 ps_key和长度信息。
 
-   
 
-   
+#### **PullImpl()**
 
-   ```c++
-    /**
-      * \brief convert to pskv for parameter server
-      * \param key
-      * \param num_arr_elems number of elements in the value for key
-      * \param num_bytes size of each element in number of bytes
-      * \return PSKV used for both push and pull
-      */
-     inline PSKV& EncodeDefaultKey(const int key, const size_t num_arr_elems,
-                                   const int num_bytes) {
-       mu_.lock();
-       PSKV& pskv = ps_kv_[key];
-       mu_.unlock();
-       size_t pskv_size = num_arr_elems * num_bytes;
-       if (!pskv.keys.empty()) {
-         CHECK_EQ(static_cast<size_t>(pskv.size), pskv_size)
-           << "The value size cannot be changed " << pskv_size << ". Key is " << key;
-       } else {
-         auto krs = ps::Postoffice::Get()->GetServerKeyRanges();
-         const int num_servers = krs.size();
-         CHECK_GT(num_servers, 0);
-   
-         // a simple heuristic for load balance
-         if (num_arr_elems < bigarray_bound_) {
-           // send it to a single random picked server
-           int server = (key * 9973) % num_servers;
-           ps::Key ps_key = krs[server].begin() + key;
-           CHECK_LT(ps_key, krs[server].end());
-           pskv.keys.push_back(ps_key);
-           const int total_bytes = num_arr_elems * num_bytes;
-           pskv.lens.push_back(total_bytes);
-           pskv.size = total_bytes;
-         } else {
-           // parition it to all servers
-           pskv.size = 0;
-           for (int i = 0; i < num_servers; ++i) {
-             size_t part_size =
-               static_cast<size_t>(round(static_cast<double>(num_arr_elems)/num_servers*(i+1))) -
-               static_cast<size_t>(round(static_cast<double>(num_arr_elems)/num_servers*i));
-             ps::Key ps_key = krs[i].begin() + key;
-             CHECK_LT(ps_key, krs[i].end());
-             pskv.keys.push_back(ps_key);
-             const int total_bytes = part_size * num_bytes;
-             pskv.lens.push_back(total_bytes);
-             pskv.size += total_bytes;
-           }
-         }
-         CHECK_EQ(static_cast<size_t>(pskv.size), pskv_size);
-       }
-       return pskv;
-     }
-   ```
+pull操作由该函数来完成，该函数会根据`keys`将**server**端的结果获取到对应的`NDArray`中。中间结果会保存在`comm_buf_[key]`中，这里由于之前`push`将该变量作为了输入，Engine在调度执行时会考虑到这点，保证所有对`comm_buf_[key]`的操作都在对它的读入完成之后，也就是push完成之后（push将它作为了输入）。类似于`Push_`操作，Pull操作定义了函数`pull_from_servers`作为异步执行的函数，调用`PushAsync`发送给Engine。<font color=red>pull_from_servers`函数调用了`ps_worker_`的`ZPull`方法来完成分布式的pull操作。</font>
 
-- **PushDefault()**
+```c++
+  void PullImpl(const std::vector<int>& keys,
+                const std::vector<NDArray*>& values,
+                int priority, bool ignore_sparse) override {
+    CHECK(ignore_sparse) << "dist kvstore pull doesn't support ignore_sparse=False";
+    std::vector<int> uniq_keys;
+    std::vector<std::vector<NDArray*> > grouped_vals;
+    GroupKVPairsPull(keys, values, &uniq_keys, &grouped_vals, true);
 
-   这里ket-value pair 主体是 key和send_buf,  pskv 保存这个tensor是否被切割及切割后的信息。
+    for (size_t i = 0; i < uniq_keys.size(); ++i) {
+      int key = uniq_keys[i];
+      // use the same array for merging to guarantee that pull always happens
+      // after the previous push on this key
+      auto& recv_buf = comm_buf_[key];
+      const auto storage_type = grouped_vals[i][0]->storage_type();
+      CHECK_EQ(storage_type, kDefaultStorage)
+               << "Expected stype of value to be kDefaultStorage";
+      if (recv_buf.is_none()) {
+        // it may happen for the first time a no-rank-0 worker pull the weight.
+        recv_buf = NDArray(grouped_vals[i][0]->shape(), pinned_ctx_,
+                           true, grouped_vals[i][0]->dtype());
+      }
+      auto pull_from_servers = [this, key, recv_buf](
+          RunContext rctx, Engine::CallbackOnComplete cb) {
+        // convert to ps keys
+        size_t size = recv_buf.shape().Size();
+        const int dtype = recv_buf.dtype();
+        const int num_bytes = mshadow::mshadow_sizeof(dtype);
+        PSKV& pskv = (gradient_compression_->get_type() == CompressionType::kNone) ?
+                      EncodeDefaultKey(key, size, num_bytes) :
+                      EncodeCompressedKey(key, size, false, num_bytes);
+        char* data = static_cast<char*> (recv_buf.data().dptr_);
+        // false means not to delete data when SArray is deleted
+        auto vals = new ps::SArray<char>(data, size * num_bytes, false);
+        // issue pull
+        RequestType mode = (gradient_compression_->get_type() != CompressionType::kNone) ?
+                  RequestType::kCompressedPushPull : RequestType::kDefaultPushPull;
+        const int cmd = GetCommandType(mode, dtype);
+        CHECK_NOTNULL(ps_worker_)->ZPull(
+          pskv.keys, vals, &pskv.lens, cmd, [vals, cb](){ delete vals; cb(); });
+      };
 
-   传递给ps_worker_->ZPush()的参数是 pskv.keys, vals, pskv.lens
+      CHECK_NOTNULL(Engine::Get())->PushAsync(
+          pull_from_servers,
+          pinned_ctx_,
+          {},
+          {recv_buf.var()},
+          FnProperty::kNormal,
+          priority,
+          "KVStoreDistDefaultStoragePull");
 
-   ```c++
-   
-     void PushDefault(int key, const NDArray &send_buf, const PSKV& pskv, int priority) {
-       auto push_to_servers =
-           [this, key, pskv, send_buf](RunContext rctx, Engine::CallbackOnComplete cb) {
-             const int dtype = send_buf.dtype();
-             // convert to ps keys
-             const size_t size = send_buf.shape().Size() * mshadow::mshadow_sizeof(dtype);
-             char* data = static_cast<char *>(send_buf.data().dptr_);
-             // do push. false means no delete
-             ps::SArray<char> vals(data, size, false);
-             int cmd = GetCommandType(RequestType::kDefaultPushPull, dtype);
-             CHECK_NOTNULL(ps_worker_)->ZPush(
-                 pskv.keys, vals, pskv.lens,
-                 cmd, [cb]() { cb(); });
-           };
-       Engine::Get()->PushAsync(
-           push_to_servers,
-           pinned_ctx_,
-           {send_buf.var()},
-           {},
-           FnProperty::kNormal,
-           priority,
-           "KVStoreDistDefaultPush");
-     }
-   ```
+      comm_->Broadcast(key, recv_buf, grouped_vals[i], priority);
+    }
+  }
+```
 
-   
 
-- **PullImpl()**
 
-   pull操作由该函数来完成，该函数会根据`keys`将**server**端的结果获取到对应的`NDArray`中。中间结果会保存在`comm_buf_[key]`中，这里由于之前`push`将该变量作为了输入，Engine在调度执行时会考虑到这点，保证所有对`comm_buf_[key]`的操作都在对它的读入完成之后，也就是push完成之后（push将它作为了输入）。类似于`Push_`操作，Pull操作定义了函数`pull_from_servers`作为异步执行的函数，调用`PushAsync`发送给Engine。<font color=red>pull_from_servers`函数调用了`ps_worker_`的`ZPull`方法来完成分布式的pull操作。</font>
+#### RunServer() 
 
-   ```c++
-     void PullImpl(const std::vector<int>& keys,
-                   const std::vector<NDArray*>& values,
-                   int priority, bool ignore_sparse) override {
-       CHECK(ignore_sparse) << "dist kvstore pull doesn't support ignore_sparse=False";
-       std::vector<int> uniq_keys;
-       std::vector<std::vector<NDArray*> > grouped_vals;
-       GroupKVPairsPull(keys, values, &uniq_keys, &grouped_vals, true);
-   
-       for (size_t i = 0; i < uniq_keys.size(); ++i) {
-         int key = uniq_keys[i];
-         // use the same array for merging to guarantee that pull always happens
-         // after the previous push on this key
-         auto& recv_buf = comm_buf_[key];
-         const auto storage_type = grouped_vals[i][0]->storage_type();
-         CHECK_EQ(storage_type, kDefaultStorage)
-                  << "Expected stype of value to be kDefaultStorage";
-         if (recv_buf.is_none()) {
-           // it may happen for the first time a no-rank-0 worker pull the weight.
-           recv_buf = NDArray(grouped_vals[i][0]->shape(), pinned_ctx_,
-                              true, grouped_vals[i][0]->dtype());
-         }
-         auto pull_from_servers = [this, key, recv_buf](
-             RunContext rctx, Engine::CallbackOnComplete cb) {
-           // convert to ps keys
-           size_t size = recv_buf.shape().Size();
-           const int dtype = recv_buf.dtype();
-           const int num_bytes = mshadow::mshadow_sizeof(dtype);
-           PSKV& pskv = (gradient_compression_->get_type() == CompressionType::kNone) ?
-                         EncodeDefaultKey(key, size, num_bytes) :
-                         EncodeCompressedKey(key, size, false, num_bytes);
-           char* data = static_cast<char*> (recv_buf.data().dptr_);
-           // false means not to delete data when SArray is deleted
-           auto vals = new ps::SArray<char>(data, size * num_bytes, false);
-           // issue pull
-           RequestType mode = (gradient_compression_->get_type() != CompressionType::kNone) ?
-                     RequestType::kCompressedPushPull : RequestType::kDefaultPushPull;
-           const int cmd = GetCommandType(mode, dtype);
-           CHECK_NOTNULL(ps_worker_)->ZPull(
-             pskv.keys, vals, &pskv.lens, cmd, [vals, cb](){ delete vals; cb(); });
-         };
-   
-         CHECK_NOTNULL(Engine::Get())->PushAsync(
-             pull_from_servers,
-             pinned_ctx_,
-             {},
-             {recv_buf.var()},
-             FnProperty::kNormal,
-             priority,
-             "KVStoreDistDefaultStoragePull");
-   
-         comm_->Broadcast(key, recv_buf, grouped_vals[i], priority);
-       }
-     }
-   ```
+```c++
+void RunServer(const Controller& controller) override {
+    CHECK(!IsWorkerNode());
+    if (IsServerNode()) {
+      server_ = new KVStoreDistServer();
+      server_->set_controller(controller);
+    }
 
-   
+    ps::StartAsync(0, "mxnet_server\0");
+    if (!ps::Postoffice::Get()->is_recovery()) {
+      ps::Postoffice::Get()->Barrier(0,
+        ps::kWorkerGroup + ps::kServerGroup + ps::kScheduler);
+    }
+    if (server_) server_->Run();
+    ps::Finalize(0, true);
+    delete server_;
+    server_ = nullptr;
+  }
+```
 
-- RunServer() :
+这个函数会被初始 import mxnet 时启动 server和scheduler所用。如上所示，如果当前节点是server，那么会运行ps::StartAsync和Barrier用于初始化，用于server_->Run()用于起server主循环线程，最后ps::Finalize。而如果当前节点是scheduler，会运行ps::StartAsync和Barrier用于初始化, 然后就ps::Finalize。
+
+### KVStoreDistServer （C++ class）
+
+<img src="mxnet-role.jpg" alt="mxnet-role" style="zoom:20%;" />
+
+- **server和scheduler的启动**：在我们通过python的`import mxnet`的时候，会有`import kvstore_server`，而导入该文件会运行`_init_kvstore_server_module()`:
 
   ```c++
+  # python code    python/mxnet/kvstore_server.py
+  def _init_kvstore_server_module():
+      """Start server/scheduler."""
+      is_worker = ctypes.c_int()
+      check_call(_LIB.MXKVStoreIsWorkerNode(ctypes.byref(is_worker)))
+      if is_worker.value == 0:
+          kvstore = create('dist')
+          server = KVStoreServer(kvstore)
+          server.run()
+          sys.exit()
+  ```
+
+  此函数会判断当前节点是否是**server 或 scheduler**节点，如果是就会创建python类KVStoreServer实例，并调用其`run()`函数，然后调用c++代码的`_LIB.MXKVStoreRunServer`，也就是c++类`KVStoreDist`的`RunServer`方法。**`RunServer`**方法中(代码如下)：
+
+  - <font color=red>对于**server 和 scheduler**节点，都会运行 ps::StartAsync , 再运行barrier `ps::Postoffice::Get()->Barrier( ,7)`</font>
+  - 如果当前节点是**server**，该方法会创建成员`server_ = new KVStoreDistServer();` ，并运行c++类 KVStoreDistServer的方法 Run(), 它是server的主循环线程， 具体细节见下面method  Run()。
+  
+  所以实际上这时的类KVStoreDist可以担任 scheduler和server两种角色
+  
+  ```c++
+  # c++ code    src/kvstore/kvstore_dist.h
+  # Class KVStoreDist
   void RunServer(const Controller& controller) override {
       CHECK(!IsWorkerNode());
       if (IsServerNode()) {
@@ -779,7 +831,149 @@ method：
     }
   ```
   
-  这个函数会被初始 import mxnet 时启动 server和scheduler所用
+  
+
+members:
+
+```c++
+  Executor exec_;
+  ps::KVServer<char>* ps_server_;
+```
+
+methods:
+
+#### constructor 创建函数
+
+创建了ps::KVServer实例，并调用其 **set_request_handle()** 设置自己的两个函数为接收到  控制信息和数据信息的处理函数。这个KVStoreDistServer 也只调用了 ps::KVServer 的这一个函数
+
+```c++
+  KVStoreDistServer() {
+    using namespace std::placeholders;
+    ps_server_ = new ps::KVServer<char>(0);
+    static_cast<ps::SimpleApp*>(ps_server_)->set_request_handle(
+        std::bind(&KVStoreDistServer::CommandHandle, this, _1, _2));
+    ps_server_->set_request_handle(
+        std::bind(&KVStoreDistServer::DataHandleEx, this, _1, _2, _3));
+    sync_mode_ = false;
+    gradient_compression_ = std::make_shared<GradientCompression>();
+    log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
+  }
+```
+
+
+
+#### Run() 
+
+ 仅仅只有一行`exec_.Start();`。这一行会调用`Executor exec_;`的`Start`方法。这个函数就是server的主循环线程。
+
+这个Start函数会一直检查 exec\_的queue\_中是否有消息块，有的话就执行。而 ps-lite中独立信息接受处理线程Customer::Receiving() 会在接收到信息后通过层层调用函数handle，最终调用 KVStoreDistServer的 CommandHandle和 DataHandleEx 函数。而这两个会调用exec_.Exec() 函数，即将需要运行的函数封装在消息block中，并放在放在exec\_ 的 queue\_ 中。这样以来，原始主线程exec\_.Start()就可以执行它。
+
+Executor的Start函数和Exec函数源码如下，当然也定义了Stop函数用于退出Start中的循环。
+
+```c++
+//c++ code            src/kvstore/kvstore_dist_server.h
+
+class Executor {.......}  // executor runs a function using the thread called \ref Start()
+
+//  start the executor
+void Start() {
+    std::unique_lock<std::mutex> lk(mu_);
+    while (true) {
+      cond_.wait(lk, [this]{return !queue_.empty();}); // queue_为空，则等待被唤醒
+      Block blk = std::move(queue_.front()); // 取出queue头元素
+      queue_.pop();
+      lk.unlock(); // 释放锁，给其他线程操作queue
+
+      if (blk.f) { // 如果blk定义了一个function，则允许他
+        blk.f();
+        blk.p->set_value(); // 返回function的结果
+      } else {
+        blk.p->set_value(); break;
+      }
+      lk.lock(); // 获取锁，执行下一个循环
+    }
+```
+
+调用`Executor`的`Exec`方法，会在`queue`中添加一个执行函数的`block`，代码如下:
+
+```c++
+ // let the thread called Start() to exec a function. threadsafe
+void Exec(const Func& func) {
+    Block blk(func); // 建立block
+    auto fut = blk.p->get_future();
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      queue_.push(std::move(blk));
+      cond_.notify_one(); // 通知别的线程运行
+    }
+    fut.wait();
+  }
+```
+
+
+
+#### **DataHandleDefault()**
+
+该方法是默认的数据处理的方法，由于`DataHandleEx`被绑定为了数据的处理函数，当`RequestType`是`kDefaultPushPull`，就会调用该函数。它会根据传入的信息，提取对应的`key`，将对应的数据存储在`store_[key]`。如果从**worker**来的request类型是**push**，就会分两种情况运行。一种是初始化的时候，由于初始化同样通过调用**push**来完成，因此初始化的**push**只会将`store_[key]`设置为对应的值。另一种是初始化后，每一次的**push**都会进行相应的操作。这里每一次从任何一个**worker**来的某一个**key**的**push**操作，都会存储在`updates.merged`中，并且除了第一次的**push**，之后的**push**会进行`updates.merged += updates.temp_array;`也就是和之前的push相加。并且`ApplyUpdates`只会在**push**数达到**worker**的个数的时候，才会真正地进行。也只有在`ApplyUpdates`真正执行的时候才会将回复返回给**worker**。这样，就实现了同步。
+
+```c++
+  void DataHandleDefault(const DataHandleType type, const ps::KVMeta& req_meta,
+                         const ps::KVPairs<char> &req_data,
+                         ps::KVServer<char>* server) {
+    // do some check
+    CHECK_EQ(req_data.keys.size(), (size_t)1);
+    if (req_meta.push) {
+      CHECK_EQ(req_data.lens.size(), (size_t)1);
+      CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[0]);
+    }
+    int key = DecodeKey(req_data.keys[0]);
+    auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
+    // there used several WaitToRead, this is because \a recved's memory
+    // could be deallocated when this function returns. so we need to make sure
+    // the operators with \a NDArray are actually finished
+    if (req_meta.push) {
+      size_t ds[] = {(size_t) req_data.lens[0] / mshadow::mshadow_sizeof(type.dtype)};
+      mxnet::TShape dshape(ds, ds + 1);
+      TBlob recv_blob;
+      MSHADOW_REAL_TYPE_SWITCH(type.dtype, DType, {
+        recv_blob = TBlob(reinterpret_cast<DType*>(req_data.vals.data()), dshape, cpu::kDevMask);
+      })
+      NDArray recved = NDArray(recv_blob, 0);
+      if (stored.is_none()) {
+        // initialization
+        stored = NDArray(dshape, Context(), false,
+                         has_multi_precision_copy(type) ? mshadow::kFloat32 : type.dtype);
+        CopyFromTo(recved, &stored, 0);
+        server->Response(req_meta);
+        stored.WaitToRead();
+      } else {
+        auto &updates = update_buf_[key];
+        if (sync_mode_ && updates.merged.is_none()) {
+          updates.merged = NDArray(dshape, Context(), false,
+                                   has_multi_precision_copy(type) ? mshadow::kFloat32 : type.dtype);
+        }
+        if (updates.request.empty()) {
+          if (sync_mode_) {
+            CopyFromTo(recved, updates.merged);
+          } else {
+              updates.temp_array = recved;
+            }
+          }
+        } else {
+          CHECK(sync_mode_);
+            updates.merged += recved;
+          }
+        }
+        updates.request.push_back(req_meta);
+        ApplyUpdates(type, key, &updates, server);
+      }
+    } else {
+      DefaultStorageResponse(type, key, req_meta, req_data, server);
+    }
+  } 
+```
+
+
 
 ### CommCPU
 
@@ -890,166 +1084,6 @@ methods：
         const std::vector<DType*> &dptr, size_t offset, index_t size)
   ```
 
-  
-
-### KVStoreDistServer （C++ class）
-
-- **server和scheduler的启动**：在我们通过python的`import mxnet`的时候，会有`import kvstore_server`，而导入该文件会运行`_init_kvstore_server_module()`:
-
-  ```c++
-  # python code    python/mxnet/kvstore_server.py
-  def _init_kvstore_server_module():
-      """Start server/scheduler."""
-      is_worker = ctypes.c_int()
-      check_call(_LIB.MXKVStoreIsWorkerNode(ctypes.byref(is_worker)))
-      if is_worker.value == 0:
-          kvstore = create('dist')
-          server = KVStoreServer(kvstore)
-          server.run()
-          sys.exit()
-  ```
-
-  此函数会判断当前节点是否是**server 或 scheduler**节点，如果是就会创建python类KVStoreServer实例，并调用其`run()`函数，然后调用c++代码的`_LIB.MXKVStoreRunServer`，也就是c++类`KVStoreDist`的`RunServer`方法。**`RunServer`**方法中：
-
-  - <font color=red>对于**server 和 scheduler**节点，都会运行 ps::StartAsync , 再运行barrier `ps::Postoffice::Get()->Barrier( ,7)`</font>
-  - 如果当前节点是**server**，该方法会创建成员`server_ = new KVStoreDistServer();` ，并运行c++类 KVStoreDistServer的方法 Run(), 具体细节见下面method  Run()
-  
-  所以实际上KVStoreDistServer可以担任 scheduler和server两种角色
-
-members:
-
-```c++
-  Executor exec_;
-  ps::KVServer<char>* ps_server_;
-```
-
-methods:
-
-- constructor 创建函数：
-
-  创建了ps::KVServer实例，并调用其 **set_request_handle()** 设置自己的两个函数为接收到  控制信息和数据信息的处理函数。这个KVStoreDistServer 也只调用了 ps::KVServer 的这一个函数
-
-  ```c++
-    KVStoreDistServer() {
-      using namespace std::placeholders;
-      ps_server_ = new ps::KVServer<char>(0);
-      static_cast<ps::SimpleApp*>(ps_server_)->set_request_handle(
-          std::bind(&KVStoreDistServer::CommandHandle, this, _1, _2));
-      ps_server_->set_request_handle(
-          std::bind(&KVStoreDistServer::DataHandleEx, this, _1, _2, _3));
-      sync_mode_ = false;
-      gradient_compression_ = std::make_shared<GradientCompression>();
-      log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
-    }
-  ```
-
-  
-
-- `Run()` : 仅仅只有一行`exec_.Start();`。这一行会调用`Executor exec_;`的`Start`方法，源码如下
-
-  ```c++
-  //c++ code            src/kvstore/kvstore_dist_server.h
-  
-  class Executor {.......}  // executor runs a function using the thread called \ref Start()
-  
-  //  start the executor
-  void Start() {
-      std::unique_lock<std::mutex> lk(mu_);
-      while (true) {
-        cond_.wait(lk, [this]{return !queue_.empty();}); // queue_为空，则等待被唤醒
-        Block blk = std::move(queue_.front()); // 取出queue头元素
-        queue_.pop();
-        lk.unlock(); // 释放锁，给其他线程操作queue
-  
-        if (blk.f) { // 如果blk定义了一个function，则允许他
-          blk.f();
-          blk.p->set_value(); // 返回function的结果
-        } else {
-          blk.p->set_value(); break;
-        }
-        lk.lock(); // 获取锁，执行下一个循环
-      }
-  ```
-  
-  调用`Executor`的`Exec`方法，会在`queue`中添加一个执行函数的`block`，代码如下:
-  
-  ```c++
-   // let the thread called Start() to exec a function. threadsafe
-  void Exec(const Func& func) {
-      Block blk(func); // 建立block
-      auto fut = blk.p->get_future();
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        queue_.push(std::move(blk));
-        cond_.notify_one(); // 通知别的线程运行
-      }
-      fut.wait();
-    }
-  ```
-  
-  
-  
-- **DataHandleDefault()**：
-
-  该方法是默认的数据处理的方法，由于`DataHandleEx`被绑定为了数据的处理函数，当`RequestType`是`kDefaultPushPull`，就会调用该函数。它会根据传入的信息，提取对应的`key`，将对应的数据存储在`store_[key]`。如果从**worker**来的request类型是**push**，就会分两种情况运行。一种是初始化的时候，由于初始化同样通过调用**push**来完成，因此初始化的**push**只会将`store_[key]`设置为对应的值。另一种是初始化后，每一次的**push**都会进行相应的操作。这里每一次从任何一个**worker**来的某一个**key**的**push**操作，都会存储在`updates.merged`中，并且除了第一次的**push**，之后的**push**会进行`updates.merged += updates.temp_array;`也就是和之前的push相加。并且`ApplyUpdates`只会在**push**数达到**worker**的个数的时候，才会真正地进行。也只有在`ApplyUpdates`真正执行的时候才会将回复返回给**worker**。这样，就实现了同步。
-  
-  ```c++
-    void DataHandleDefault(const DataHandleType type, const ps::KVMeta& req_meta,
-                           const ps::KVPairs<char> &req_data,
-                           ps::KVServer<char>* server) {
-      // do some check
-      CHECK_EQ(req_data.keys.size(), (size_t)1);
-      if (req_meta.push) {
-        CHECK_EQ(req_data.lens.size(), (size_t)1);
-        CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[0]);
-      }
-      int key = DecodeKey(req_data.keys[0]);
-      auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
-      // there used several WaitToRead, this is because \a recved's memory
-      // could be deallocated when this function returns. so we need to make sure
-      // the operators with \a NDArray are actually finished
-      if (req_meta.push) {
-        size_t ds[] = {(size_t) req_data.lens[0] / mshadow::mshadow_sizeof(type.dtype)};
-        mxnet::TShape dshape(ds, ds + 1);
-        TBlob recv_blob;
-        MSHADOW_REAL_TYPE_SWITCH(type.dtype, DType, {
-          recv_blob = TBlob(reinterpret_cast<DType*>(req_data.vals.data()), dshape, cpu::kDevMask);
-        })
-        NDArray recved = NDArray(recv_blob, 0);
-        if (stored.is_none()) {
-          // initialization
-          stored = NDArray(dshape, Context(), false,
-                           has_multi_precision_copy(type) ? mshadow::kFloat32 : type.dtype);
-          CopyFromTo(recved, &stored, 0);
-          server->Response(req_meta);
-          stored.WaitToRead();
-        } else {
-          auto &updates = update_buf_[key];
-          if (sync_mode_ && updates.merged.is_none()) {
-            updates.merged = NDArray(dshape, Context(), false,
-                                     has_multi_precision_copy(type) ? mshadow::kFloat32 : type.dtype);
-          }
-          if (updates.request.empty()) {
-            if (sync_mode_) {
-              CopyFromTo(recved, updates.merged);
-            } else {
-                updates.temp_array = recved;
-              }
-            }
-          } else {
-            CHECK(sync_mode_);
-              updates.merged += recved;
-            }
-          }
-          updates.request.push_back(req_meta);
-          ApplyUpdates(type, key, &updates, server);
-        }
-      } else {
-        DefaultStorageResponse(type, key, req_meta, req_data, server);
-      }
-    } 
-  ```
-  
   
 
 
@@ -1311,6 +1345,8 @@ Trainer.\_params:  list of Parameter instances. Trainer._param2idx 保存 Parame
 
 **原因： 数据集cifar10 的单个输入图片长宽小于标准数据集（imagenet）的图片输入。数据集会影响模型大小（单个图片的长宽对应于模型中的某些节点数量）。batch-size不会影响模型大小。**
 
+用数据集 caltech101 就是138M数据量了，这时 batch size 只能为32，否则out of memory
+
 
 
 ### Worker Init function path
@@ -1319,7 +1355,8 @@ Trainer.\_params:  list of Parameter instances. Trainer._param2idx 保存 Parame
 
 **<font color=green>KVStore.init() (python)  --> KVStoreDist.InitImpl()  -->  KVStoreDist.Push_() --> KVStoreDist.PushDefault()</font>--> ps:: KVWorker.ZPush() -->  ps:: KVWorker.Send() --> <font color=red>Postoffice::Get()->van()->Send(msg) --> ZMQVan.SendMsg()</font>**
 
-
+- 其中上述path中绿色函数中的 tensor存在形式为 {int key, NDArray value} ,绿色和黑色函数中处理一个完整tensor，红色函数则只处理一个切分后的小tensor。
+- **<font color=green> KVStoreDist.InitImpl()</font>**中会判断，只有当`get_rank() == 0 && this->ps_worker_->get_customer()->customer_id() == 0)` ，即当前worker是 rank=0，id=9 的第一个worker时，才会真正执行**Push_** , 否则 do nothing。即所有的worker的 init 只有第一个worker真正的把初始数据传输给了server。
 
 ### Worker Push function path 
 
@@ -1408,7 +1445,7 @@ main path:
 
   调用ZPull() 也会传入cd，用于之后的ps::KVWorker执行。
 
-- <font color=green>KVStoreDist.PullImpl()</font>** 调用 ps:: KVWorker.ZPull() -> Pull\_()** 的输入数据结构和之前的 ZPush 一样 ，**ps:: KVWorker.Pull_()** 定义了 callback。 
+- **<font color=green>KVStoreDist.PullImpl()</font>** 调用 ps:: KVWorker.ZPull() -> Pull\_() 的输入数据结构和之前的 ZPush 一样 ，**ps:: KVWorker.Pull_()** 定义了 callback。 
 
 - **ps:: KVWorker.Pull_(key，value)** <font color=red>定义了 cb_0, 并根据timestamp保存起来</font>。再调用 ***Send(ts, false, cmd, kvs)** ; 其中第二个参数表示当前操作为pull，这个 bool 信息会在 Send() 中被写入 msg.meta.push 中。之后worker接受到server回复的pull梯度数据后执行cb_0。cb_0 中从 recv_kvs_[ts] 取出接收到的 server数据，赋给value，并且执行之前传递下来的cd，即通知mxnet Engine 这个pull已成功完成。
 
@@ -1484,4 +1521,12 @@ server receiving path:
 
 - ZMQVan.RecvMsg() --> Van.Receiving() --> Customer.Accept() --> Customer.recv_queue_.Push(msg)
 - Customer.Receiving() --> ps::KVServer.Process() --> ps::SimpleApp.Process() --> KVStoreDistServer.CommandHandle()
+
+## 6 Copy in Push and Pull
+
+1) Push时， KVStoreDist::Push_()  中先把要push的数据copy到 comm_buf\_[key] 中。
+
+2） Pull时， KVStoreDist::PullImpl() 调用 ps::KVWorker::ZPull() 把pull回来的数据 copy到 comm_buf\_[key] , 再调用 comm\_.Broadcast() 把comm_buf\_[key] 的数据 copy 到 真正的 vals中。
+
+3） Push和Pull再调用 Engine::PushAsync() 时设定的依赖变量是 comm_buf\_[key]  ， 所以可以告诉engine正确的依赖关系。
 

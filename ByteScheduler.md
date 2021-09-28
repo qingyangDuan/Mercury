@@ -542,3 +542,59 @@ functions:
 
   - 为python中的 NDArray 实例在c++中新建一个映射，数据相同。这样 python层面就多了一个实例和handle。<font color=red>暂时不知道这样做的用意。</font>
   - 被  KVStoreTask.\_prepare() 和 KVStoreTask.\_partition_single_tensor() 调用，用于生成 **avatar** : a new handle list of self._tensor.
+
+## 3 Auto-tuning
+
+### Env variable
+
+ByteCore.\__init__()
+
+```python
+# Partition unit, i.e., the number of parameters
+self._partition = int(os.environ.get('BYTESCHEDULER_PARTITION', 1000000))
+
+# Credit, i.e., the max number of unacknowledged parameters
+self._credit = float(os.environ.get('BYTESCHEDULER_CREDIT', 4000000))
+self._credit_limit = self._credit
+
+# We expect that the first key is same across iterations and we use it to count how many training steps have
+# been run.
+self._first_key = None
+self._step = 0
+
+# Tuning
+self._credit_tuning = int(os.environ.get('BYTESCHEDULER_CREDIT_TUNING', 1))
+self._partition_tuning = int(os.environ.get('BYTESCHEDULER_PARTITION_TUNING', 0))
+```
+
+### Turning range & frequency
+
+
+
+Turner.\__init__()   
+
+```python
+        if credit_tuning:
+            if arch == "ps":
+                space["credit"] = (1.0, 16.0)
+            else:
+                space["credit"] = (4.0, 64.0)
+
+        if partition_tuning:
+            space["partition"] = (2.0, 32.0)
+
+        max_num_steps = 15
+```
+
+Turner.record()   
+
+```python
+# By default average the training time of 100 step as one point.
+if len(self._timestamps) > 100:
+    self._tune(current_point, step)
+```
+
+
+
+
+

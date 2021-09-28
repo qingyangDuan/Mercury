@@ -19,26 +19,30 @@
 
 
 
-## 2, test_simple_app及通信流程
+## 2, W\S\H初始化及通信流程
 
-test_simple_app.cc是一个很简单的app，其它复杂的流程原理这个程序差不多，所以我们就说说这个程序是怎么运行的。先来看下刚开始运行程序时，worker(W)\Server(S)\Scheduler(H)之间是怎么连接的，这里没有写Customer处理普通信息的流程。W\S\H代表上面脚本运行各个角色后在不同角色程序内的处理流程。主要函数：
+以test_simple_app.cc为例，这是一个很简单的app，其它复杂的流程原理这个程序差不多，所以我们就说说这个程序是怎么运行的。worker(W)\Server(S)\Scheduler(H)三个角色所在的机器同时运行这个实例代码，本节介绍它们之间是怎么连接的。W\S\H代表这个脚本运行后各个角色后在不同角色程序内的处理流程。test_simple_app.cc主要代码为：
 
 ```c++
 #include "ps/ps.h"
 using namespace ps;
 
-  Start(0);
-  SimpleApp app(0, 0); // (app_id, customer_id) one App can have multiple customers 
+  Start(0); // (customer_id)
+  SimpleApp app(0, 0); or  KVWorker worker(0,0) ;  or  KVServer server(0) ;// (app_id, customer_id) one App can have multiple customers 
   Finalize(0, true);
 
 
 ```
 
+使用ps-lite主要是两步：(1) W\S\H 运行Start(),  (2) W\S创建对应自己角色的app（SimpleApp\KVWorker\KVServer）。
 
+MXNet使用ps-lite的方法就是：a) W\S在KVStoreDist \ KVStoreDistServer的constructor中创建ps::KVWorker\ps::KVServer；b) W\S\H 运行ps::StartAsync()。ps::StartAsync 与ps::Start 的唯一区别是，StartAsync中，当Postoffice和 van的 start初始化完成之后，不会执行Barrier(7)，而需要再手动执行barrier。这里也说明了创建app和执行Start()可以不分先后。
 
-### 2.1 全局初始化流程
+### 2.1 Start初始化流程
 
-- W\S\H：class Postoffice中：初始化static PostOffice和 它的 Van，全局都用同一个PostOffice --> Create(Van)用来做通信的发/发 --> 从环境变量中读入配置 --> 确定不同的角色。
+W\S\H的Start函数会初始化PostOffice和Van，并初始化三种节点的互联。
+
+- W\S\H：class Postoffice中：初始化static PostOffice和 它的 Van，全局都用同一个PostOffice --> Create(Van)用来做通信的收/发 --> 从环境变量中读入配置 --> 确定不同的角色。
 
 - W\S\H：Start() --> PostOffice::Start() --> ZMQVan::Start() --> Van::Start()
 
@@ -51,45 +55,52 @@ using namespace ps;
   - H ( Van::ProcessAddNodeCommand ) ：接受 ADD_NODE 消息
   - H ( Van::UpdataLocalID ) ：接受 ADD_NODE 消息， 把 server 和 worker 的节点信息保存在 meta* **nodes** 中。
   - H ( Van::ProcessAddNodeCommandAtScheduler ) ：收到所有的servers + worker 的 ADD_NODE信息后，便分配rank(即id) 。 把所有的nodes（包括H自己）的id、ip、port等信息打包在 meta* **nodes**中，然后发送 ADD_NODE消息给所有的 W\S, 当然这个消息中携带了 **nodes** 信息。 
-  - W\S ( Van::ProcessAddNodeCommand ) : 收到 ADD_NODE 信息后，先在 Van::UpdataLocalID 更新自己的id为 H分配的数值。之后对消息中的 meta* **nodes** 信息包含的所有节点，都执行 ZMQVan::Connect(node)，即连接到了所有的其他节点。 <font color=red>当然ZMQVan中会避免重复连接同一个节点（因此此前 W\S 已经连接过了H）；也会避免 server连接server、worker连接worker，因为这是无意义的。</font>
-  - W\S\H ( PostOffice::Start ) : Van::Start()结束后，PostOffice::Start() 执行 Barrier()。 这个函数会向scheduler发送 BARRIER 消息并阻塞主线程。scheduler的 Van::Receiving() 线程收到所有的 node 的 barrier msg，即表示所有节点都完成了上述的初始化，然后scheduler解除自己及所有node的barrier，主线程恢复。 <font color=red> BARRIER消息中的 msg.meta.request 为 true 代表一个普通的 BARRIER消息， 为false则代表一个解除当前 BARRIER的消息。</font>
+  - W\S ( Van::ProcessAddNodeCommand ) : 收到 ADD_NODE 信息后，先在 Van::UpdataLocalID 更新自己的id为 H分配的数值。之后对消息中的 meta* **nodes** 信息包含的所有节点，都执行 ZMQVan::Connect(node)，即连接到了所有的其他节点。 <font color=blue>当然ZMQVan中会避免重复连接同一个节点（因此此前 W\S 已经连接过了H）；也会避免 server连接server、worker连接worker，因为这是无意义的。</font>
+  - W\S\H ( PostOffice::Start ) : Van::Start()结束后，PostOffice::Start() 执行 Barrier()。 这个函数会向scheduler发送 BARRIER 消息并阻塞主线程。scheduler的 Van::Receiving() 线程收到所有的 node 的 barrier msg，即表示所有节点都完成了上述的初始化，然后scheduler解除自己及所有node的barrier，主线程恢复。 <font color=blue> BARRIER消息中的 msg.meta.request 为 true 代表一个普通的 BARRIER消息， 为false则代表一个解除当前 BARRIER的消息。</font>
 
-- W\S：初始化SimpleApp --> New Customer（绑定SimpleAPP::Process作为Customer的recv_handle_，调用PostOffice::AddCustomer将当前Customer注册到PostOffice） --> <font color=red>Customer起一个Receiving线程</font>
+### 2.2 创建app，并绑定app的customer到全局PostOffice
 
-- W\S\H：Finalize()
+  - W\S：初始化app ：在app内部创建New Customer（用 app_id 和 customer_id 标识），并绑定app::Process作为Customer的recv_handle_，调用PostOffice::AddCustomer将当前Customer注册到全局PostOffice，从而可以接受van上传的消息 --> <font color=red>Customer起一个Receiving线程</font>
 
-所以使用ps-lite主要是两步：(1) W\S\H 运行Start(),  (2) W\S创建对应自己角色的app（如worker）。而mxnet使用ps-lite的方法就是在KVStoreDist的创建函数和RunServer中创建ps::Worker, 创建ps::Server, 运行ps::StartAsync()。
+一个线程只有一个全局PostOffice实例及其包含的van，可以有多个app。每个app内部有一个customer实例，其主要用于app接收消息。具体如下：
 
-### 2.2 消息处理流程
+- customer实例在初始化时被注册到全局PostOffice实例中，用（app_id, customer_id）区分。customer实例会起一个Receiving线程，用于接受van传递给它的msg。van接收到msg后根据（app_id, customer_id) 在全局PostOffice实例中寻找对应的customer，然后把msg给这个customer的Receiving线程处理。
 
-每个节点都监听了本地一个端口；该连接的节点在启动时已经连接。
-对于Server节点：
+每个app调用全局PostOffice实例的van发送消息，发送时注明app_id和customer_id，以便接收方的van能够找到正确的destination app。 每个app通过自身的customer实例接收消息。
 
-- `Van::Receiving()`函数是单独一个线程来接收数据。数据接收后，根据不同Control命令执行不同动作，例如`Control::ADD_NODE`就是添加节点。如果是 DataMsg，会将消息传递给`Customer::Accept`函数。
+
+
+### 2.3 消息处理流程
+
+每个节点都监听了本地一个端口，该连接的节点在启动时已经连接。
+
+- `Van::Receiving()`函数是单独一个线程来接收消息。它会接收到两种消息： controlMsg和 dataMsg。前者是Van内部用于控制启停及各节点互联初始化的消息，一般没有数据（这些消息主要应用在 Start()函数执行阶段, 如 TERMINATE,  ADD_NODE, BARRIER,  HEATBEAT等等特殊命令）；后者是外部通过调用app的函数传递的消息，一般包含数据（如调用KVWorker，KVServer的push、pull传递数据）。 接收到消息后，如果是controlMsg，则根据不同 msg.meta.control.cmd 执行不同动作，在Van类内处理（例如`Control::ADD_NODE`就是添加节点）；如果是 DataMsg，会根据消息的app_id 和 customer_id 找到指定的customer对象，然后将消息传递给该对象的`Customer::Accept`函数。
+
+以下假设创建的app是SimpleApp：
+
 - `Customer::Accept()`函数将消息添加到一个队列`recv_queue_`；`Customer::Receiving()`是一个线程在运行，从队列取消息处理；处理过程中会使用函数对象`recv_handle_`处理消息，这个函数对象是`SimpleApp::Process`函数。
 - `SimpleApp::Process`根据是消息类型（请求or响应），调用用户注册的函数来处理消息，`request_handle_`、`response_handle_`分别处理请求和响应。
 
-对于Worker节点，上面第3点略有不同。因为Worker都是通过`Push`、`Pull`来通信，而且参数都是key-value对。`Pull·参数时，通过KVWorker::Process`调用回调函数来处理消息。
+以上只是原始SimpleApp基类的处理流程，如果创建的app是其派生类KVWorker， KVServer， 那么设置的处理函数句柄`recv_handle_` `request_handle_` `response_handle_`会有所不同。
 
-### 2.3 Van消息处理流程
+### 2.4 消息处理流程KVWorker/KVServer版
 
-无论是worker节点还是server节点，在程序的最开始都会执行`Postoffice::start()`。`Postoffice::start()`会初始化节点信息，并且调用`Van::start()`。而`Van::start()`则会让当前节点与Scheduler节点相连，并且**启动一个本地线程 Van::Receiving() thread**来持续监听收到的message。
-
-worker和server都继承自SimpleApp类，所以都有一个customer对象。
-customer对象本身也会**启动一个 Customer::Receiving() thread**，其中调用注册的`recv_handle_`函数对消息进行处理。
+KVWorker和KVServer都继承自SimpleApp类。
 
 1）对于worker来说，其注册的`recv_handle_`是`KVWorker::Process()`函数。因为worker的recv thread接受到的消息主要是从server处pull下来的KV对，因此该`Process()`主要是接收message中的KV对；
 
-2）而对于Server来说，其注册的`recv_handle_`是`KVServer::Process()`函数。因此server接受的是worker们push上来的KV对，需要对其进行处理，因此该`Process()`函数中调用的用户通过`KVServer::set_request_handle()`传入的函数对象。
+2）而对于Server来说，其注册的`recv_handle_`是`KVServer::Process()`函数。因此server接受的是worker们push上来的KV对，需要对其进行处理，因此该`Process()`调用用户通过`KVServer::set_request_handle()`传入的函数句柄来处理消息。
+
+### 2.5 Customer 记录消息控制同步异步依赖
 
 每个customer对象都拥有一个`tracker_`(`std::vector<std::pair<int, int>>`类型)用来记录每个请求发送和返回的数量。
 `tracker_`的下标即为请求的timestamp，`tracker_[t].first`是该请求发送给了多少节点，`tracker[t]_.second`是该请求收到了多少节点的回复。`customer::Wait()`就是一直阻塞直到`tracker_[t].first == tracker[t].second`，用这个来控制同步异步依赖。
 
-每当`Van`的recv thread收到一个message时，会判断msg的种类。两类msg，一类是Control msg，有： 1）TERMINATE,  2）ADD_NODE, 3） BARRIER, 4)  HEATBEAT; 另一类是 DataMsg。 如果Van接收到Control msg，则在Van类内处理；如果是 Data msg，就会根据customer id的不同将message发给不同的customer的recv thread，即Customer::Accept函数处理。同时该message对应的请求（设为req）则`tracker_[req.timestamp].second++`。
+Customer::Accept函数处理`Van::Receiving()` 传递的 dataMsg时，同时该message对应的请求（设为req）则`tracker_[req.timestamp].second++`。
 
 
 
-### 2.4 Customer处理信息流程
+### 2.6 Customer处理信息流程
 
 Customer处理普通信息流程如下：
 
@@ -170,10 +181,14 @@ SimpleApp 和 Customer类中的 id：
 Every node's id is unique, scheduler's id is always 1.
 
 - **scheduler id is 1**
-
 - servers rank：0、1、2、3......; **server node.rank to id**: id = rank * 2 + 8
 - workers rank：0、1、2、3......; **worker node.rank to id**: id = rank * 2 + 9
 - **node.id to rank**:  rank = std::max((id - 8) / 2, 0)
+
+用一个 id 表示一组节点：
+
+-  kScheduler = 1;   kServerGroup = 2;   kWorkerGroup = 4;
+- 例如：发送给id=6表示------发送给所有servers+workers
 
 ​      
 
