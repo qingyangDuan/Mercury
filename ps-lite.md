@@ -188,7 +188,7 @@ Every node's id is unique, scheduler's id is always 1.
 用一个 id 表示一组节点：
 
 -  kScheduler = 1;   kServerGroup = 2;   kWorkerGroup = 4;
-- 例如：发送给id=6表示------发送给所有servers+workers
+- 例如：发送给id=6表示------发送给所有servers+workers.
 
 ​      
 
