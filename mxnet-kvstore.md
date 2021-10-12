@@ -699,7 +699,7 @@ for (int i = 0; i < num_servers_; ++i) {
 
 #### **PullImpl()**
 
-pull操作由该函数来完成，该函数会根据`keys`将**server**端的结果获取到对应的`NDArray`中。中间结果会保存在`comm_buf_[key]`中，这里由于之前`push`将该变量作为了输入，Engine在调度执行时会考虑到这点，保证所有对`comm_buf_[key]`的操作都在对它的读入完成之后，也就是push完成之后（push将它作为了输入）。类似于`Push_`操作，Pull操作定义了函数`pull_from_servers`作为异步执行的函数，调用`PushAsync`发送给Engine。<font color=red>pull_from_servers`函数调用了`ps_worker_`的`ZPull`方法来完成分布式的pull操作。</font>
+pull操作由该函数来完成，该函数会根据`keys`将**server**端的结果获取到对应的`NDArray`中。中间结果会保存在`comm_buf_[key]`中，这里由于之前`push`将该变量作为了输入，Engine在调度执行时会考虑到这点，保证所有对`comm_buf_[key]`的写操作(pull) 都在对它的读操作(push, 因为push将它作为了Engine的输入)完成之后。类似于`Push_`操作，Pull操作定义了函数`pull_from_servers`作为异步执行的函数，调用`PushAsync`发送给Engine。<font color=red>`pull_from_servers`函数调用了`ps_worker_`的`ZPull`方法来完成分布式的pull操作。</font>
 
 ```c++
   void PullImpl(const std::vector<int>& keys,
@@ -1348,6 +1348,15 @@ Trainer.\_params:  list of Parameter instances. Trainer._param2idx 保存 Parame
 用数据集 caltech101 就是138M数据量了，这时 batch size 只能为32，否则out of memory
 
 
+
+### All workers'  init behaviours       
+
+- First worker(rank:0, id: 9) will do Init(Push) & Pull at first. 
+
+  (When server receives the first pushed gradients, it stores them as merged gradients)
+
+- Other workers will do Init(do nothing) & Pull at first.
+  
 
 ### Worker Init function path
 
