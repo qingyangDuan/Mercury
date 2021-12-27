@@ -1234,9 +1234,23 @@ methods:
                       updater(i, w, g)
   ```
 
+## 5 update_on_kvstore
+
+- 由环境变量 MXNET_UPDATE_ON_KVSTORE  控制, 用来决定是否在ps端更新参数，这个参数在python的KVStore类初始化时被使用。如果该变量为True，那么模型参数的更新发生在ps端；否则，模型参数的更新发生在worker端，ps端只做梯度的聚合操作（这种情况下，paramerter server是不是就变成了gradient server？）。
+
+- 只有在同步训练模式下，我们才能设置`update_on_kvstore=False`，异步训练并不支持在worker端更新参数。
+
+- 在`update_kv_store=True`的情况下，我们需要告诉ps端训练过程中使用的优化器是什么，因此要调用`kvstore.set_optimizer`把优化器从worker端传给ps端。**<font color=red>具体为 python的KVStore类用pickle。dumps把optimizer对象序列化，其c++类通过ps-lite的SimpleApp.Request函数把序列化后的字符串发送给PS端。PS端的python的KVStoreServer类用pickle.loads将其反序列化得到优化器对象</font>**。
+
+同步训练模式下调用Trainer类的参数同步有两种方式，如下图（最左一列为Trainer类内部的与参数同步有关的函数，右边格子中为这个函数具体执行了哪些操作。这些函数只工作在worker端。当update_on_kvstore=true时，updater操作在PS端完成，因此worker端没有updater操作，pull回来的直接就是全局参数）：
+
+- 图上部的一种模式为直接调用Trainer.step()； 
+- 图下部的一种模式为worker端需要对聚合后的梯度进行一定操作（如图中的clip操作），因此只能用update_on_kvstore=false 模式 ， 需要手动调用Trainer的两个同步函数。
+
+<img src="update_on_kvstore.jpg" alt="update_on_kvstore" style="zoom:20%;" />
 
 
-## 5 tensor structure and transmission
+## 6 tensor structure and transmission
 
 
 
@@ -1377,7 +1391,7 @@ here , a tensor =  a key-value pair = a parameter group of one NN layer
 
 
 
-- 其中上述path中绿色函数中的 tensor存在形式为 {int key, NDArray value} ,绿色和黑色函数中处理一个完整tensor，红色函数则只处理一个切分后的小tensor。
+- 其中上述path中绿色函数中的 tensor存在形式为 {int key, NDArray value} ,绿色和黑色函数中处理一个完整tensor，红色函数则只处理一个切分后的小tensor（这个切分是针对多个PSes的load balancing）。
 
 - **<font color=green>KVStoreDist.Push_()</font>**函数中借助EncodeDefaultKey() 函数分割tensor并保存分割信息到 pskv 中。 此时 pskv.keys 中包含一个或 num_server 个 ps_key
 
@@ -1403,7 +1417,7 @@ here , a tensor =  a key-value pair = a parameter group of one NN layer
     kvs.lens = lens;
     ```
 
-- **ps::KVWorker.Send()** 调用DefaultSlicer根据kvs.keys 的 ps_key 的数值大小进行切分，得到包含切分后的小tensor的 <bool, KVPairs>的 vector, 保存在 sliced 中。<font color=red>原来的 kvs.keys 中包含一个或 num_server 个 ps_key，但是 sliced 中一定有且仅有有 num_servers 个 <bool , KVPairs></font>，每一个在 vector中的位置对应要发送给的 server ID。bool 表示要不要发。这时以及经过切分，所以每个 KVPairs.keys 只包含一个 ps_key。
+- **ps::KVWorker.Send()** 调用DefaultSlicer根据kvs.keys 的 ps_key 的数值大小进行切分，得到包含切分后的小tensor的 <bool, KVPairs>的 vector, 保存在 sliced 中。<font color=red>原来的 kvs.keys 中包含一个或 num_server 个 ps_key，但是 sliced 中一定有且仅有有 num_servers 个 <bool , KVPairs></font>，每一个在 vector中的位置对应要发送给的 server rank。bool 表示要不要发。这时以及经过切分，所以每个 KVPairs.keys 只包含一个 ps_key。
 
   ```c++
   using SlicedKVs = std::vector<std::pair<bool, KVPairs<Val>>>;  
@@ -1531,11 +1545,10 @@ server receiving path:
 - ZMQVan.RecvMsg() --> Van.Receiving() --> Customer.Accept() --> Customer.recv_queue_.Push(msg)
 - Customer.Receiving() --> ps::KVServer.Process() --> ps::SimpleApp.Process() --> KVStoreDistServer.CommandHandle()
 
-## 6 Copy in Push and Pull
+## 7 Copy in Push and Pull
 
 1) Push时， KVStoreDist::Push_()  中先把要push的数据copy到 comm_buf\_[key] 中。
 
 2） Pull时， KVStoreDist::PullImpl() 调用 ps::KVWorker::ZPull() 把pull回来的数据 copy到 comm_buf\_[key] , 再调用 comm\_.Broadcast() 把comm_buf\_[key] 的数据 copy 到 真正的 vals中。
 
 3） Push和Pull再调用 Engine::PushAsync() 时设定的依赖变量是 comm_buf\_[key]  ， 所以可以告诉engine正确的依赖关系。
-

@@ -60,7 +60,7 @@ W\S\H的Start函数会初始化PostOffice和Van，并初始化三种节点的互
 
 ### 2.2 创建app，并绑定app的customer到全局PostOffice
 
-  - W\S：初始化app ：在app内部创建New Customer（用 app_id 和 customer_id 标识），并绑定app::Process作为Customer的recv_handle_，调用PostOffice::AddCustomer将当前Customer注册到全局PostOffice，从而可以接受van上传的消息 --> <font color=red>Customer起一个Receiving线程</font>
+  - W\S：初始化app ：在app内部创建New Customer（用 app_id 和 customer_id 标识），并绑定app::Process作为Customer的recv_handle_。Custumor创建函数会自动调用PostOffice::AddCustomer将当前Customer注册到全局PostOffice，从而可以接受van上传的消息 --> <font color=red>Customer起一个Receiving线程</font>
 
 一个线程只有一个全局PostOffice实例及其包含的van，可以有多个app。每个app内部有一个customer实例，其主要用于app接收消息。具体如下：
 
@@ -176,7 +176,7 @@ SimpleApp 和 Customer类中的 id：
 	- 如果 msg->meta.request 为 false，则由 Postoffice::Get()->Manage(*msg) 执行 barrier_cond_.notify_all()  ，从而接触当前node的barrier。
 	- Postoffice::Barrier() 中会设置 barrier_cond_.wait(), 从而阻塞当前线程。
 
-### 3.5 id rank
+### 3.5 id & rank
 
 Every node's id is unique, scheduler's id is always 1.
 
