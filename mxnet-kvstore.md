@@ -1240,7 +1240,7 @@ methods:
 
 - 只有在同步训练模式下，我们才能设置`update_on_kvstore=False`，异步训练并不支持在worker端更新参数。
 
-- 在`update_kv_store=True`的情况下，我们需要告诉ps端训练过程中使用的优化器是什么，因此要调用`kvstore.set_optimizer`把优化器从worker端传给ps端。**<font color=red>具体为 python的KVStore类用pickle。dumps把optimizer对象序列化，其c++类通过ps-lite的SimpleApp.Request函数把序列化后的字符串发送给PS端。PS端的python的KVStoreServer类用pickle.loads将其反序列化得到优化器对象</font>**。
+- 在`update_on_kvstore=True`的情况下，我们需要告诉ps端训练过程中使用的优化器是什么，因此要调用`kvstore.set_optimizer`把优化器从worker端传给ps端。**<font color=red>具体为 python的KVStore类用pickle.dumps把optimizer对象序列化，其c++类通过ps-lite的SimpleApp.Request函数把序列化后的字符串发送给PS端。PS端的python的KVStoreServer类用pickle.loads将其反序列化得到优化器对象</font>**。
 
 同步训练模式下调用Trainer类的参数同步有两种方式，如下图（最左一列为Trainer类内部的与参数同步有关的函数，右边格子中为这个函数具体执行了哪些操作。这些函数只工作在worker端。当update_on_kvstore=true时，updater操作在PS端完成，因此worker端没有updater操作，pull回来的直接就是全局参数）：
 
