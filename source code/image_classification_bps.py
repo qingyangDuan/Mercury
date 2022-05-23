@@ -306,27 +306,7 @@ def main():
         profiler.set_config(profile_all=True, aggregate_stats=True)
         profiler.set_state('run')
     if opt.mode == 'symbolic':
-        """
-        data = mx.sym.var('data')
-        if opt.dtype == 'float16':
-            data = mx.sym.Cast(data=data, dtype=np.float16)
-        out = net(data)
-        if opt.dtype == 'float16':
-            out = mx.sym.Cast(data=out, dtype=np.float32)
-        softmax = mx.sym.SoftmaxOutput(out, name='softmax')
-        mod = mx.mod.Module(softmax, context=context)
-        train_data, val_data = get_data_iters(dataset, batch_size, opt)
-        mod.fit(train_data,
-                eval_data=val_data,
-                num_epoch=opt.epochs,
-                kvstore=kv,
-                batch_end_callback = mx.callback.Speedometer(batch_size, max(1, opt.log_interval)),
-                epoch_end_callback = mx.callback.do_checkpoint('image-classifier-%s'% opt.model),
-                optimizer = opt.optimizer,
-                optimizer_params = {'learning_rate': opt.lr, 'wd': opt.wd, 'momentum': opt.momentum, 'multi_precision': True},
-                initializer = mx.init.Xavier(magnitude=2))
-        mod.save_parameters('image-classifier-%s-%d-final.params'%(opt.model, opt.epochs))
-        """
+	# do nothing
     else:
         if opt.mode == 'hybrid':
             net.hybridize()
