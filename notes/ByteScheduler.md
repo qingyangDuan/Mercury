@@ -227,7 +227,7 @@ methods:
 
 它的几个函数实现原论文中的 Dependency Proxy 功能。以下为原论文中的描述：
 
-<img src="pics/ByteScheduler-dependency.png"  style="zoom:90%;" />
+<img src="pics/ByteScheduler-dependency.PNG"  style="zoom:90%;" />
 
 > **Dependency Proxy**: A Proxy is an operation created by ByteScheduler. It can be posted into the framework engines, and claim dependencies from/to other operations. Declarative engines all provide direct APIs to define such dependencies since this is the fundamental feature of such engines. 
 >
