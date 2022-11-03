@@ -1,0 +1,2 @@
+- 首先，修复 mxnet-1.5/include 里的软连接，使得其指向 3rdparty 中制定的位置。
+- pip3 install --user horovod==0.18.0   // for mxnet-1.5.x
