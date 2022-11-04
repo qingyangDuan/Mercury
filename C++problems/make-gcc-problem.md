@@ -12,7 +12,7 @@ CFLAGS = -g
 LDFLAGS = -L/home/duanqingyang/libvma/src/vma/.libs   
 INFLAGS = -I/home/duanqingyang/libvma/src/vma/.libs   
 
-g++ \$(INFLAGS) \$(LDFLAGS) \$(CFLAGS) -o client client.cc  #-lvma     
+g++  \$(INFLAGS) \$(LDFLAGS) \$(CFLAGS) -o client client.cc  #-lvma     
 
 
 
