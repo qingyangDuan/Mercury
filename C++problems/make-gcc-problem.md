@@ -1,6 +1,5 @@
 # 1）GDB
 如果我们要用gdb去debug（如用clion的gdb调试）, 要用 `-g` 的 cflags   
-   - 对于MXNet来说，要在 config.mk 中设置 DEBUG=1， 即在make时会加入 `-g`   
 
 # 2）-Ixxx
 原 .cc 文件需要 include 的一些自定义的 .h 等 header 文件，那么 .h 的位置需要添加到 -Ipath 中    
