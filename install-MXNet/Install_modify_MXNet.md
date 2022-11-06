@@ -22,6 +22,8 @@ gluonnlp: 0.8.3
      - 把incubator-mxnet-1.5/make/config.mk文件复制到incubator-mxnet-1.5/ 内指导编译，
      - 修改config.mk内部的几个选项数值： USE_DIST_KVSTORE = 1，USE_MKLDNN = 0, USE_CUDA=1, USE_CUDA_PATH = XXX（CUDA文件夹具体位置）。
      - 执行 make 命令
+ - **3.1) debug**:
+     - # 如果要用gdb调试，要在 config.mk 中设置 DEBUG=1， 即在make时会加入 `-g`   
  - **4) 安装**：`python3 -m pip install --user -e ./python`  
 Note that the `-e` flag is optional. It is equivalent to --editable,   
 and means that if you edit the source files, these changes will be reflected in the package installed.  
