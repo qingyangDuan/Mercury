@@ -6,6 +6,6 @@
   - It seems that it is due to the code size being too large. The cause of this problem could be because we are generating code for too many architectures by default. 
   - So just manually modify Makefile. Set KNOWN_CUDA_ARCHs to build on only a few architectures. **(it's 61 for 1080Ti GPU)** And the compiling can be faster. 
 - **调试模式的影响：**
- NVCC 的编译 flags 也会加入 `-G`, 这会影响cuda程序的性能，使得GPU的训练速度降低很多。  两个选择：
+ NVCC 的编译 flags 也会加入 `-G`, 这会影响cuda程序的性能，使得GPU的训练速度降低很多。  保持原性能的两种做法：
   - config.mk 中设置 DEBUG=0. 禁用调试模式。 
-  - 手动修改Makefile, 删除 NVCC 的 `-g  -G` flags. 
+  - 手动修改Makefile, 删除 NVCC 的 `-g  -G` flags. 这样只具备调试 c++ 程序的能力。 
