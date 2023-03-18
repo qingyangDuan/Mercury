@@ -1,4 +1,4 @@
-# Mxnet Engine Async process task（c++）
+**Mxnet Engine Async process task（c++）**
 
 files location：include/mxnet/engine.h    src/engine/*
 
@@ -26,9 +26,13 @@ The following API is the core interface for the execution engine:
 
 This API allows you to push a function (`exec_fun`), along with its context information and dependencies, to the engine. `exec_ctx` is the context information in which the `exec_fun` should be executed. `const_vars` denotes the variables that the function reads from, and `mutate_vars` are the variables to be modified. Regardless of the details that we’ll explain later, the engine guarantees following order:
 
-> *The execution of any two functions when one of them modifies at least one common variable is serialized in their push order.*  (For details, see "VarHandle" part)
+**The execution of any two functions when one of them modifies at least one common variable is serialized in their push order.**  (For details, see "VarHandle" part)
 
 - 可见，输入的 **const_vars** 和 **mutate_vars** 并不是 vector\<NDArray>（tensor 就是 NDArray实例），而是 vector\<**NDArray.var()**>。显然 NDArray.var() 返回的就是 VarHandle。
+
+在分布式训练的一次迭代中，各个func用Pushsync放进Engine中。Engine根据 const_vars 和 mutate_vars 来确定各个func的依赖关系，并对无依赖的func执行一定的并行化以加速执行。各个func执行时互相依赖关系的例子：
+
+<img src="pics/engine-example.jpg" style="zoom:20%;" />
 
 
 ### Function

@@ -1,16 +1,16 @@
 
 
-# ByteScheduler
+ByteScheduler
 
-## 1 arch
+# 1 arch
 
 <img src="pics/ByteScheduler-uml.png" alt="uml-final" style="zoom:67%;" />
 
 上图左边是没有ByteScheduler 的原始 mxnet push调用依赖uml图，右图是加入了ByteScheduler 的uml图。可见ByteScheduler舍弃了 _LIB和c++类 KVStoreDist，而对 python类 KVStore进行新的封装重写，得到ScheduledKVStore。且ScheduledKVStore的实现依赖于原始 KVStore的一些方法和Engine。
 
-## 2 Classes
+# 2 Classes
 
-### ScheduledKVStore（继承自 mx.kvstore.KVStore）
+## ScheduledKVStore（继承自 mx.kvstore.KVStore）
 
 - 重写mx.kvstore.KVStore的三个methods：init()   push()   pull()。 之后使用中用这个类代替原来的类来使用。用法：
 
@@ -85,7 +85,7 @@ methods:
   
   
 
-### ByteCore
+## ByteCore
 
 - The core of ByteScheduler. Once Core gets a ByteTask (which represents a communication operation, e.g., push,    allreduce), it partitions the ByteTask and decides when to send each partition according to priority.
 
@@ -181,7 +181,7 @@ self._scheduler.start()
   
   
 
-### ByteTask
+## ByteTask
 
 - A unified communication operation (e.g., push, pull, allreduce) abstraction for ALL ML frameworks and
       communication methods.
@@ -221,7 +221,7 @@ methods:
   
    
 
-### KVStoreTask (继承自 ByteTask)
+## KVStoreTask (继承自 ByteTask)
 
 
 
@@ -503,7 +503,7 @@ methods:
 
 
 
-### BYTESCHEDULER_LIB（python instance for c++ lib)
+## BYTESCHEDULER_LIB（python instance for c++ lib)
 
 functions:
 
@@ -541,9 +541,9 @@ functions:
   - 为python中的 NDArray 实例在c++中新建一个映射，数据相同。这样 python层面就多了一个实例和handle。<font color=red>暂时不知道这样做的用意。</font>
   - 被  KVStoreTask.\_prepare() 和 KVStoreTask.\_partition_single_tensor() 调用，用于生成 **avatar** : a new handle list of self._tensor.
 
-## 3 Auto-tuning
+# 3 Auto-tuning
 
-### Env variable
+## Env variable
 
 ByteCore.\__init__()
 
@@ -565,7 +565,7 @@ self._credit_tuning = int(os.environ.get('BYTESCHEDULER_CREDIT_TUNING', 1))
 self._partition_tuning = int(os.environ.get('BYTESCHEDULER_PARTITION_TUNING', 0))
 ```
 
-### Turning range & frequency
+## Turning range & frequency
 
 
 

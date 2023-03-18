@@ -1,8 +1,8 @@
 
 
-# VGG16 in mxnet
+VGG16 in mxnet
 
-## Model Size
+# Model Size
 
 - 数据集cifar10时： 总大小38M左右，如下图右边部分，主要是由于原来理论上一个102M的tensor变成了2M左右。
 
@@ -16,13 +16,13 @@
 
 
 
-## Forward function roadmap
+# Forward function roadmap
 
 **net() -> HybridBlock.forward() -> VGG.hybrid_forward()**
 
 net is a instance of class VGG
 
-### image_classification.py 中的 **net()** :
+## image_classification.py 中的 **net()** :
 
 ```python
 net=VGG()  #class VGG(HybridBlock)
@@ -39,7 +39,7 @@ for i, batch in enumerate(train_data):
           trainer.step(batch.data[0].shape[0])
 ```
 
-### class HybridBlock
+## class HybridBlock
 
 file: python/mxnet/gluon/block.py
 
@@ -70,7 +70,7 @@ def forward(self, x, *args):
 
 
 
-### class VGG
+## class VGG
 
 file: python/mxnet/gluon/model_zoo/vision/vgg.py
 
@@ -118,7 +118,7 @@ def __init__(self, layers, filters, classes=1000, batch_norm=False, **kwargs):
           return featurizer
 ```
 
-### Dense and Cov2D
+## Dense and Cov2D
 
 python class **nn.Dense** : python/mxnet/gluon/nn/basic_layers.py
 

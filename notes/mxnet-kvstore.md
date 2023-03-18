@@ -1,6 +1,6 @@
 
 
-# Mxnet kvstore(python) to ps-lite(c++) api
+how Mxnet kvstore(python) using  ps-lite(c++) api to do push and pull
 
 mxnet-1.5
 
@@ -191,6 +191,26 @@ methods:
 ### KVStoreServer
 
 - file: python/mxnet/kvstore_server.py
+
+  The following is called when doing  `import mxent` ->`import kvstore_server`
+
+  So for scheduler and server, training python file is ignored.  Only ` server.run()` is executed.
+
+  ```python
+  def _init_kvstore_server_module():
+      """Start server/scheduler."""
+      is_worker = ctypes.c_int()
+      check_call(_LIB.MXKVStoreIsWorkerNode(ctypes.byref(is_worker)))
+      if is_worker.value == 0:
+          kvstore = create('dist')
+          server = KVStoreServer(kvstore)
+          server.run()
+          sys.exit()
+  
+  _init_kvstore_server_module()
+  ```
+
+  
 
 methods:
 
@@ -529,7 +549,7 @@ updater的设置是通过python端的函数定义来完成的，它通过ctype�
 
 #### **Push_()**
 
-若 do_merge 为 true，push操作首先会通过`comm_-> Reduce()`操作。之后结果存储在`comm_buf_[key]`中。
+若 do_merge 为 true，push操作首先会通过`comm_-> Reduce()`操作，<font color=red>即先取得本地多GPU间的tensor之和</font>。之后结果存储在`comm_buf_[key]`中。
 
 调用 **EncodeDefaultKey** 函数将存储为`key : int`和`val : NDArray`形式的KVPair，转化为`PSKV`形式，该形式用于Push操作。<font color=red>同时也实现servers load balancing。</font>
 
@@ -699,7 +719,7 @@ for (int i = 0; i < num_servers_; ++i) {
 
 #### **PullImpl()**
 
-pull操作由该函数来完成，该函数会根据`keys`将**server**端的结果获取到对应的`NDArray`中。中间结果会保存在`comm_buf_[key]`中，这里由于之前`push`将该变量作为了输入，Engine在调度执行时会考虑到这点，保证所有对`comm_buf_[key]`的写操作(pull) 都在对它的读操作(push, 因为push将它作为了Engine的输入)完成之后。类似于`Push_`操作，Pull操作定义了函数`pull_from_servers`作为异步执行的函数，调用`PushAsync`发送给Engine。<font color=red>`pull_from_servers`函数调用了`ps_worker_`的`ZPull`方法来完成分布式的pull操作。</font>
+pull操作由该函数来完成，该函数会根据`keys`将**server**端的结果获取到对应的`NDArray`中。中间结果会保存在`comm_buf_[key]`中，这里由于之前`push`将该变量作为了输入，Engine在调度执行时会考虑到这点，保证所有对`comm_buf_[key]`的写操作(pull) 都在对它的读操作(push, 因为push将它作为了Engine的输入)完成之后。类似于`Push_`操作，Pull操作定义了函数`pull_from_servers`作为异步执行的函数，调用`PushAsync`发送给Engine。<font color=red>`pull_from_servers`函数调用了`ps_worker_`的`ZPull`方法来完成分布式的pull操作</font>。之后调用 comm_->Broadcast(）完成从server接收的 global tensor 发送给所有本地GPU，当然次函数内部的 copy都会进去Engine，即保证了此broadcast操作是在 ZPull完成后才执行。 
 
 ```c++
   void PullImpl(const std::vector<int>& keys,
@@ -781,7 +801,11 @@ void RunServer(const Controller& controller) override {
   }
 ```
 
-这个函数会被初始 import mxnet 时启动 server和scheduler所用。如上所示，如果当前节点是server，那么会运行ps::StartAsync和Barrier用于初始化，用于server_->Run()用于起server主循环线程，最后ps::Finalize。而如果当前节点是scheduler，会运行ps::StartAsync和Barrier用于初始化, 然后就ps::Finalize。
+这个函数会被初始 import mxnet 时启动 server和scheduler所用。如上所示：
+
+- 如果当前节点是server，那么会运行ps::StartAsync和Barrier用于初始化；之后server_->Run()用于起server主循环线程， server->Run()  函数内只有接收到结束信号才会返回 ，最后ps::Finalize()。
+- 而如果当前节点是scheduler，会运行ps::StartAsync和Barrier用于初始化, 然后直接执行ps::Finalize。
+- ps::Finalize这个函数会执行Barrier，即等待其他节点都执行ps::Finalize 后才会返回。server/scheduler执行此函数的位置就是这里，而worker在KVStoreDist的析构函数中执行这个函数。
 
 ### KVStoreDistServer （C++ class）
 
@@ -1018,6 +1042,8 @@ methods：
     }
   ```
 
+- Broadcast()
+
 - Reduce()
 
   调用 ReduceSumCPU()
@@ -1084,7 +1110,17 @@ methods：
         const std::vector<DType*> &dptr, size_t offset, index_t size)
   ```
 
-  
+
+### CommDevice
+
+本地的 GPU to GPU间直接通信
+
+methods:
+
+- Broadcast() ： 把某个tensor 数据广播到本地多GPU上
+- Reduce(): 获得本地多GPU间的 某个 tensor数据之和
+
+
 
 
 ## 4 gluon: "imperative" training 
@@ -1381,7 +1417,9 @@ Trainer.\_params:  list of Parameter instances. Trainer._param2idx 保存 Parame
 **<font color=green>KVStore.init() (python)  --> KVStoreDist.InitImpl()  -->  KVStoreDist.Push_() --> KVStoreDist.PushDefault()</font>--> ps:: KVWorker.ZPush() -->  ps:: KVWorker.Send() --> <font color=red>Postoffice::Get()->van()->Send(msg) --> ZMQVan.SendMsg()</font>**
 
 - 其中上述path中绿色函数中的 tensor存在形式为 {int key, NDArray value} ,绿色和黑色函数中处理一个完整tensor，红色函数则只处理一个切分后的小tensor。
-- **<font color=green> KVStoreDist.InitImpl()</font>**中会判断，只有当`get_rank() == 0 && this->ps_worker_->get_customer()->customer_id() == 0)` ，即当前worker是 rank=0，id=9 的第一个worker时，才会真正执行**Push_** , 否则 do nothing。即所有的worker的 init 只有第一个worker真正的把初始数据传输给了server。
+- **<font color=green> KVStoreDist.InitImpl()</font>**
+  - 有当`get_rank() == 0 && this->ps_worker_->get_customer()->customer_id() == 0)` ，即当前worker是 rank=0，id=9 的第一个worker时，执行**Push_** ，（令这个函数在push完成后才返回）。其他worker节点  do nothing。即所有的worker的 init 只有第一个worker真正的把初始数据传输给了server。
+  - 上述完成后，所有worker都会调用 Barrier()。使得do nothing的节点在等待第一个worker完成参数上传初始化后才返回InitImpl() 本函数。
 
 ### Worker Push function path 
 

@@ -1,6 +1,5 @@
-# BytePS
 
-## 0，Install BytePs
+# 0，Install BytePs
 
 - Change gcc  to version 4.9
 
@@ -15,6 +14,10 @@
 - Run `sudo  python3 -m pip install .`  to install it to `/usr/local/lib/python3.7/XXX`
 
   or `sudo  python3 setup.py install`  to install it to `/usr/lib/python3.7/XXX`
+  
+  or `python3 setup.py install --user`  to install it to `~/.local/lib/python3.7/XXX`
+  
+  对于最后一种方法，装进去的是一个 `xx/site-packages/bytepsxxxxx.egg` ;  如果 Python的 sys.path 一般只有这个路径：`xx/site-packages`， 因此最好把 `xx/site-packages/bytepsxxxxx.egg/byteps` 复制为`xx/site-packages/byteps`
 
 **problems:**
 
@@ -31,13 +34,12 @@
 - If you need to recompile BytePS:
   
   - **Delete `byteps/build`   `byteps/byteps.egg-info`  `byteps/__pycache__` .** Or it won't recompile, but just uses precious compiled  libraried in those directories.
-  
   - ( Optional ) Delete installed python module in system.   e.g., in `/usr/local/lib/python3.7/dist-packages/byteps-XXX` or`/usr/lib/python3.7/dist-packages/byteps-XXX`
-  - Run `sudo  python3 -m pip install ` to recompile.
+  - Run `sudo  python3 -m pip install ` to recompile and install.
 
-## 1，BytePS for MXNet 的 push_pull 的流程  
+# 1，BytePS for MXNet 的 push_pull 的流程  
 
-### 1.1 对每个tensor的入队处理
+## 1.1 对每个tensor的入队处理
 
 - byteps/byteps/mxnet/\_\_init\_\_.py     _do_push_pull( tensor )
 - byteps/byteps/mxnet/ops.py           byteps_push_pull( tensor )
@@ -52,7 +54,7 @@
     - **每个 task都有queue_list ，为一个string list。  每个task的queue_list 初始化为{ REDUCE，  COPYD2H, PUSH， PULL, COPYH2D,  BROADCAST}，表示这个task的生命历程为先进入第一个全局 reduce_queue, 等待被scheduling执行完成REDUCE操作；再进入下一个全局copyd2h_queue等待本操作执行； 等等等等，直到最后一个操作完成。** 如果考虑压缩，那么queue_list 为 在 PUSH前加入COMPRESS，在 PULL后加入 DECOMPRESS。
     - 上述每个特定的全局queue都有一个异步的线程，一直根据preemption-based scheduling 的规则，从这个queue中取出最高优先级的task进行执行
 
-### 1.2 每个queue的异步处理
+## 1.2 每个queue的异步处理
 
  queue的统一模板，代码位置：byteps/byteps/common/scheduled_queue.cc
 
@@ -75,7 +77,7 @@ queue的 run loop，  代码位置：byteps/byteps/common/core_loops.cc
   - v = task->counter_ptr.get()->fetch_add(1)：即对这个 task的 counter_ptr 执行 add 1
   - if (v == (int)(task->total_partnum - 1)) 即如果 这个task 所属的父tensor的所有 子task都完成，那么执行其 complete callback （即为其父tensor的 complete callback）。往上层层传导，最后告诉MXNet Engine Core 这个 tensor的push_pull operator 已经执行完成。
 
-### 1.3 push_queue 的异步 run loop
+## 1.3 push_queue 的异步 run loop
 
 代码位置：byteps/byteps/common/core_loops.cc
 
@@ -86,7 +88,7 @@ queue的 run loop，  代码位置：byteps/byteps/common/core_loops.cc
   - 执行 BytePSGlobal::**EncodeDefaultKey()** 为这个task选择 server 
   - 用 BytePSGlobal::GetPS()->ZPush() 调用 ps-lite 发送 task， 绑定的 complete callback是函数 FinishOrProceed()
 
-### 1.4 pull_queue 的异步 run loop
+## 1.4 pull_queue 的异步 run loop
 
 pull 的过程与上述push类似：
 
@@ -104,13 +106,13 @@ pull 的过程与上述push类似：
 
   
 
-## 2，partition和 credit 实现在哪？
+# 2，partition和 credit 实现在哪？
 
 根据上述描述，调度实现在communication stack 中的位置：位于Engine Core以下，ps-lite以上（或称 ZMQ以上）。
 
 
 
-## 3， server 的选择：实现load distribution 
+# 3， server 的选择：实现load distribution 
 
 代码位置：在 byteps/byteps/common/global.cc
 

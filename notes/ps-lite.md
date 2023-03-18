@@ -1,6 +1,4 @@
-# ps-lite
-
-## 1, main classes
+# 1, main classes
 
 <img src ="pics/ps-lite-uml.png" >
 
@@ -21,7 +19,7 @@
 
 
 
-## 2, W\S\H初始化及通信流程
+# 2, W\S\H初始化及通信流程
 
 以test_simple_app.cc为例，这是一个很简单的app，其它复杂的流程原理这个程序差不多，所以我们就说说这个程序是怎么运行的。worker(W)\Server(S)\Scheduler(H)三个角色所在的机器同时运行这个实例代码，本节介绍它们之间是怎么连接的。W\S\H代表这个脚本运行后各个角色后在不同角色程序内的处理流程。test_simple_app.cc主要代码为：
 
@@ -40,7 +38,7 @@ using namespace ps;
 
 MXNet使用ps-lite的方法就是：a) W\S在KVStoreDist \ KVStoreDistServer的constructor中创建ps::KVWorker\ps::KVServer；b) W\S\H 运行ps::StartAsync()。ps::StartAsync 与ps::Start 的唯一区别是，StartAsync中，当Postoffice和 van的 start初始化完成之后，不会执行Barrier(7)，而需要再手动执行barrier。这里也说明了创建app和执行Start()可以不分先后。
 
-### 2.1 Start初始化流程
+## 2.1 Start初始化流程
 
 W\S\H的Start函数会初始化PostOffice和Van，并初始化三种节点的互联。
 
@@ -61,32 +59,47 @@ W\S\H的Start函数会初始化PostOffice和Van，并初始化三种节点的互
   - W\S\H ( Van::Start )  Van:::Start 结束。
   - W\S\H ( PostOffice::Start ) : Van::Start()结束后，PostOffice::Start() 执行 Barrier()。 这个函数会向scheduler发送 BARRIER 消息并阻塞主线程。scheduler的 Van::Receiving() 线程收到所有的 node 的 barrier msg，即表示所有节点都完成了上述的初始化，然后scheduler解除自己及所有node的barrier，主线程恢复。 <font color=blue> BARRIER消息中的 msg.meta.request 为 true 代表一个普通的 BARRIER消息， 为false则代表一个解除当前 BARRIER的消息。</font>
 
-### 2.2 创建app，并绑定app的customer到全局PostOffice
+ <font color=red>注意，以上的建立连接阶段，消息类型都是control msg 。接下来的app间的消息类型是data msg。</font>。
 
-  - W\S：初始化app ：在app内部创建New Customer（用 app_id 和 customer_id 标识），并绑定app::Process作为Customer的recv_handle_。Custumor创建函数会自动调用PostOffice::AddCustomer将当前Customer注册到全局PostOffice，从而可以接受van上传的消息 --> <font color=red>Customer起一个Receiving线程</font>
+## 2.2 创建app
 
-一个线程只有一个全局PostOffice实例及其包含的van，可以有多个app。每个app内部有一个customer实例，其主要用于app接收消息。具体如下：
+- 原始ps-lite实现中，每个W只创建一个KVWorker类型的app, 每个S只创建一个KVServer类型的app, 这些app之间通过 ZMQVan 传输 data msg， 即为梯度或参数。 H不创建app。
 
-- customer实例在初始化时被注册到全局PostOffice实例中，用（app_id, customer_id）区分。customer实例会起一个Receiving线程，用于接受van传递给它的msg。van接收到msg后根据（app_id, customer_id) 在全局PostOffice实例中寻找对应的customer，然后把msg给这个customer的Receiving线程处理。
+我们可以根据自己的需求自定义app实现并在不同角色线程中创建，从而实现这些app间的通信（通过底层ZMQVan）。<font color=red>**每个线程（W\S\H）只有一个全局PostOffice实例及其包含的van，但可以有多个app，用（app_id，customer_id ）区分。线程A上的某个app可发送 data msg 给线程B，那么线程B中与A有相同（app_id，customer_id ）的app会接受到消息。**</font> 如果线程B中没有这样的app，会出错。下面解释app 之间如何借助van进行通信：
 
-每个app调用全局PostOffice实例的van发送消息，发送时注明app_id和customer_id，以便接收方的van能够找到正确的destination app。 每个app通过自身的customer实例接收消息。
+- 1）app创建过程如下 ：
+
+  在app内部创建New Customer（用 app_id 和 customer_id 标识），并绑定app::Process作为Customer的recv_handle_。Custumor创建函数会自动调用PostOffice::AddCustomer将当前Customer注册到全局PostOffice，从而可以接受van上传的消息。 <font color=red>Customer起一个Receiving线程</font>。
+
+- 2）上述例子中 data msg 的发送接收过程如下：
+  
+  - 线程A上的app 调用本线程的全局PostOffice实例的van，发送data msg给线程B。在msg中要指定 recv_id, app_id, customer_id。
+  - 线程B上的van接收到msg后根据（app_id, customer_id) 在全局PostOffice实例中寻找对应的customer，然后把msg给这个customer的Receiving线程处理。这个customer 再把msg给到对应app的recv_handle_函数里处理。
+
+自定义app时需要注意：
+
+- 1）**令customer_id = app_id** ：
+  - ps-lite实际实现中，W节点初始化app时用（app_id，customer_id ）标识自己的customer，而S节点初始化app时用（app_id，app_id ）标识自己的customer。这些app仍能互相通信。这是因为，<font color=red>底层的van对接受到的data msg处理时，如果本节点是W，则用msg中的（ app_id ， customer_id ）标识搜寻对应的customer；如果不是W，则用msg中的（ app_id ， app_id ）标识搜寻对应的customer。</font>详情见 van.cc 的Van::ProcessDataMsg() 函数实现。
+  - 因此为了不出错，我们自定义的app初始化时，最好令标识（ app_id ， customer_id ）中的 customer_id = app_id 。
+- 2）**通信范围**：
+  - 原始 ps-lite 的 ZMQVan 只建立了 （1）所有节点向H的通信连接，（2）任一 W 和任一 S 的连接。所有 app 借助原始 ZMQVan不能实现 W 和另一 W ，或 S 和另一 S 的通信。
 
 
 
-### 2.3 消息处理流程
+## 2.3 消息处理流程
 
 每个节点都监听了本地一个端口，该连接的节点在启动时已经连接。
 
 - `Van::Receiving()`函数是单独一个线程来接收消息。它会接收到两种消息： controlMsg和 dataMsg。前者是Van内部用于控制启停及各节点互联初始化的消息，一般没有数据（这些消息主要应用在 Start()函数执行阶段, 如 TERMINATE,  ADD_NODE, BARRIER,  HEATBEAT等等特殊命令）；后者是外部通过调用app的函数传递的消息，一般包含数据（如调用KVWorker，KVServer的push、pull传递数据）。 接收到消息后，如果是controlMsg，则根据不同 msg.meta.control.cmd 执行不同动作，在Van类内处理（例如`Control::ADD_NODE`就是添加节点）；如果是 DataMsg，会根据消息的app_id 和 customer_id 找到指定的customer对象，然后将消息传递给该对象的`Customer::Accept`函数。
 
-以下假设创建的app是SimpleApp：
+以下假设创建的app是SimpleApp： （可自定义自己的app类，继承自SimpleApp）
 
 - `Customer::Accept()`函数将消息添加到一个队列`recv_queue_`；`Customer::Receiving()`是一个线程在运行，从队列取消息处理；处理过程中会使用函数对象`recv_handle_`处理消息，这个函数对象是`SimpleApp::Process`函数。
 - `SimpleApp::Process`根据是消息类型（请求or响应），调用用户注册的函数来处理消息，`request_handle_`、`response_handle_`分别处理请求和响应。
 
 以上只是原始SimpleApp基类的处理流程，如果创建的app是其派生类KVWorker， KVServer， 那么设置的处理函数句柄`recv_handle_` `request_handle_` `response_handle_`会有所不同。
 
-### 2.4 消息处理流程KVWorker/KVServer版
+## 2.4 消息处理流程KVWorker/KVServer版
 
 KVWorker和KVServer都继承自SimpleApp类。
 
@@ -94,7 +107,7 @@ KVWorker和KVServer都继承自SimpleApp类。
 
 2）而对于Server来说，其注册的`recv_handle_`是`KVServer::Process()`函数。因此server接受的是worker们push上来的KV对，需要对其进行处理，因此该`Process()`调用用户通过`KVServer::set_request_handle()`传入的函数句柄来处理消息。
 
-### 2.5 Customer 记录消息控制同步异步依赖
+## 2.5 Customer 记录消息控制同步异步依赖
 
 每个customer对象都拥有一个`tracker_`(`std::vector<std::pair<int, int>>`类型)用来记录每个请求发送和返回的数量。
 `tracker_`的下标即为请求的timestamp，`tracker_[t].first`是该请求发送给了多少节点，`tracker[t]_.second`是该请求收到了多少节点的回复。`customer::Wait()`就是一直阻塞直到`tracker_[t].first == tracker[t].second`，用这个来控制同步异步依赖。
@@ -103,7 +116,7 @@ Customer::Accept函数处理`Van::Receiving()` 传递的 dataMsg时，同时该m
 
 
 
-### 2.6 Customer处理信息流程
+## 2.6 Customer处理信息流程
 
 Customer处理普通信息流程如下：
 
@@ -115,9 +128,9 @@ Customer处理普通信息流程如下：
 
 
 
-## 3 ,一些实现细节
+# 3 ,一些实现细节
 
-###  3.1 位运算表示node和node group
+##  3.1 位运算表示node和node group
 
 因为有时请求要发送给多个节点，所以ps-lite用了一个map来存储**每个id对应的实际的node节点**。
 
@@ -133,13 +146,13 @@ Customer处理普通信息流程如下：
 
 如此来说，对于每一个新节点，需要将其对应多个id上。例如对于worker2来说，需要将它与4,4+1,4+2,4+1+2,12这4个id相对应。
 
-### 3.2 KVPairs把keys数组和values数组分开
+## 3.2 KVPairs把keys数组和values数组分开
 
 KVPairs的数据结构并非按照 `vector<pair<key, vector<values>>>`，而是按照`vector<key>`, `vector<values>`来组成。
 这是因为，对于worker来说，它所拥有的部分数据集train data通常都是不变的，那这些数据集所引用的keys通常也是不变的。
 这样的话，worker和server之间互相通信的时候，就可以不发送vector，仅发送vector了，可以降低一部分网络带宽。
 
-### 3.3 工作类SimpleApp，KVWorker，KVServer的初始化和api
+## 3.3 工作类SimpleApp，KVWorker，KVServer的初始化和api
 
 SimpleApp 和 Customer类中的 id：
    * app_id： the globally unique id indicating the application the postoffice serving for
@@ -171,7 +184,7 @@ SimpleApp 和 Customer类中的 id：
 
 
 
-### 3.4 Barrier
+## 3.4 Barrier
 
 - 初始化时：所有节点在 PostOffice::Start() 结尾时设置BARRIER，即发送 barrier msg（group为7，request为true）给Scheduler， 并阻塞当前主线程。Scheduler每接受到一个barrier msg后，在 Van::ProcessBarrierCommand 中增加 barrier_count_[group]。接收完所有barrier msg 后，Scheduler 给所有节点发送  取消barrier msg（request为False）。
 - Van::Receiving() 线程中的 Van::ProcessBarrierCommand 中收到的 msg 处理逻辑：
@@ -179,13 +192,15 @@ SimpleApp 和 Customer类中的 id：
 	- 如果 msg->meta.request 为 false，则由 Postoffice::Get()->Manage(*msg) 执行 barrier_cond_.notify_all()  ，从而接触当前node的barrier。
 	- Postoffice::Barrier() 中会设置 barrier_cond_.wait(), 从而阻塞当前线程。
 
-### 3.5 id & rank
+## 3.5 id & rank
 
 Every node's id is unique, scheduler's id is always 1.
 
 - **scheduler id is 1**
-- servers rank：0、1、2、3......; **server node.rank to id**: id = rank * 2 + 8
-- workers rank：0、1、2、3......; **worker node.rank to id**: id = rank * 2 + 9
+- servers rank：                                0、 1、   2、   3......
+  - **server id = rank * 2 + 8**       8、10、 12、 14.......
+- workers rank：                              0、  1、   2、    3...... 
+  - **worker id = rank * 2 + 9**      9、 11、 13、 15......
 - **node.id to rank**:  rank = std::max((id - 8) / 2, 0)
 
 用一个 id 表示一组节点：
